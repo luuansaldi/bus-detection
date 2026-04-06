@@ -57,6 +57,19 @@ DIRECTION_CAM = "Cam 1"
 CAM1_LINE_RED_X    = 0.80   # right barrier
 CAM1_LINE_YELLOW_X = 0.18   # left barrier
 
+# Fallback: if no line crossing is detected, use net horizontal displacement.
+# net_dx < -MIN_DIRECTION_PX → entering (moving left), net_dx > MIN_DIRECTION_PX → exiting.
+MIN_DIRECTION_PX = 80
+
+# Hysteresis: direction candidate must be consistent for this many consecutive frames
+# before it's confirmed. Prevents a single noisy frame from triggering a wrong direction.
+DIRECTION_MIN_FRAMES = 3
+
+# Minimum total displacement from first-seen position before a bus is considered
+# "active" and fed into OCR. Filters YOLO bbox jitter on parked buses — jitter
+# oscillates around the same point, real movement accumulates away from it.
+ACTIVATION_DISTANCE_PX = 60
+
 # Bus visible in the same slot for this many seconds without crossing either line
 # → treated as parked; will not vote in the consensus buffer.
 PARKED_TIMEOUT_SEC = 30.0
@@ -106,9 +119,15 @@ class MotionFilter:
             # New bus — create slot, skip this frame
             self._slots[self._next_slot] = {
                 "cx_last": cx, "cy": cy,
+                "cx_first": cx, "cy_first": cy,
+                "ema_cx": cx, "ema_cy": cy,   # smoothed position (EMA)
                 "static_count": 1,
                 "first_crossing": None,
+                "confirmed_direction": None,  # direction confirmed after hysteresis
+                "direction_candidate": None,  # last candidate seen
+                "direction_streak": 0,        # consecutive frames with same candidate
                 "first_seen_time": now,
+                "last_seen_time": now,
             }
             self._next_slot += 1
             return False
@@ -122,6 +141,12 @@ class MotionFilter:
         else:
             slot["static_count"] += 1
 
+        # Update EMA (α=0.35): jitter averages out near the true position;
+        # real sustained movement shifts the EMA steadily away from the origin.
+        alpha = 0.35
+        slot["ema_cx"] = alpha * cx + (1 - alpha) * slot["ema_cx"]
+        slot["ema_cy"] = alpha * cy + (1 - alpha) * slot["ema_cy"]
+
         # Line-crossing detection (Cam 1 only): record which barrier was crossed first
         if frame_width > 0 and slot["first_crossing"] is None:
             red_x    = frame_width * CAM1_LINE_RED_X
@@ -133,6 +158,16 @@ class MotionFilter:
 
         slot["cx_last"] = cx
         slot["cy"] = cy
+        slot["last_seen_time"] = now
+
+        # Activation check: use the EMA position instead of raw cx to filter YOLO
+        # bbox jitter. Jitter oscillates → EMA stays near cx_first. Real movement
+        # accumulates → EMA drifts away. Only activate when EMA displacement exceeds
+        # the threshold.
+        ema_disp = ((slot["ema_cx"] - slot["cx_first"]) ** 2 +
+                    (slot["ema_cy"] - slot["cy_first"]) ** 2) ** 0.5
+        if ema_disp < ACTIVATION_DISTANCE_PX:
+            return False
 
         # Parked timeout: bus in slot too long without crossing any line → parked
         if slot["first_crossing"] is None and now - slot["first_seen_time"] > PARKED_TIMEOUT_SEC:
@@ -144,13 +179,94 @@ class MotionFilter:
         """
         Return "entering", "exiting", or None (unknown).
         Only meaningful for DIRECTION_CAM. Must be called after is_moving().
+
+        Priority:
+        1. Line crossing (hard signal — bus crossed a virtual barrier). Instant confirm.
+        2. Net horizontal displacement with hysteresis: candidate must be the same for
+           DIRECTION_MIN_FRAMES consecutive frames before it's confirmed as direction.
+           Prevents a single noisy detection from triggering a wrong result.
         """
         x1, y1, x2, y2 = detection.bbox
         cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
         sid = self._find_slot(cx, cy)
         if sid is None:
             return None
-        return self._slots[sid]["first_crossing"]  # None | "entering" | "exiting"
+        slot = self._slots[sid]
+
+        # Hard signal: line crossing always wins immediately.
+        if slot["first_crossing"] is not None:
+            return slot["first_crossing"]
+
+        # Already confirmed via hysteresis — return cached result.
+        if slot["confirmed_direction"] is not None:
+            return slot["confirmed_direction"]
+
+        # Compute candidate from smoothed (EMA) displacement, consistent with
+        # activation check — raw cx_last has jitter, ema_cx does not.
+        net_dx = slot["ema_cx"] - slot["cx_first"]
+        if net_dx < -MIN_DIRECTION_PX:
+            candidate = "entering"
+        elif net_dx > MIN_DIRECTION_PX:
+            candidate = "exiting"
+        else:
+            candidate = None
+
+        # Hysteresis: accumulate streak for consistent candidates.
+        if candidate is None:
+            slot["direction_candidate"] = None
+            slot["direction_streak"] = 0
+        elif candidate == slot["direction_candidate"]:
+            slot["direction_streak"] += 1
+            if slot["direction_streak"] >= DIRECTION_MIN_FRAMES:
+                slot["confirmed_direction"] = candidate
+        else:
+            slot["direction_candidate"] = candidate
+            slot["direction_streak"] = 1
+
+        return slot["confirmed_direction"]
+
+    def draw_cam1_overlay(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Draw direction debug overlay on a copy of a Cam 1 frame.
+        Shows virtual barrier lines, bus trajectory, net_dx, and direction state.
+        """
+        out = frame.copy()
+        h, w = out.shape[:2]
+
+        # Virtual barrier lines
+        red_x    = int(w * CAM1_LINE_RED_X)
+        yellow_x = int(w * CAM1_LINE_YELLOW_X)
+        cv2.line(out, (red_x, 0),    (red_x, h),    (0, 0, 255),   2)
+        cv2.line(out, (yellow_x, 0), (yellow_x, h), (0, 255, 255), 2)
+        cv2.putText(out, "ENTRA", (red_x - 60, 20),    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255),   1)
+        cv2.putText(out, "SALE",  (yellow_x + 5, 20),  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+        now = time.monotonic()
+        for slot in self._slots.values():
+            # Only draw slots seen in the last 5 seconds — skip stale/parked buses
+            if now - slot["last_seen_time"] > 5.0:
+                continue
+
+            cx_first = int(slot["cx_first"])
+            cx_last  = int(slot["cx_last"])
+            cy       = int(slot["cy"])
+            net_dx   = slot["cx_last"] - slot["cx_first"]
+            candidate = slot["direction_candidate"]
+            confirmed = slot["confirmed_direction"] or slot["first_crossing"]
+            streak    = slot["direction_streak"]
+
+            # Trajectory arrow: from first seen to current position
+            color = (0, 255, 0) if confirmed else (0, 165, 255)
+            cv2.arrowedLine(out, (cx_first, cy), (cx_last, cy), color, 2, tipLength=0.3)
+            cv2.circle(out, (cx_last, cy), 6, color, -1)
+
+            # Info text
+            dir_text  = confirmed or (f"{candidate}? ({streak}/{DIRECTION_MIN_FRAMES})" if candidate else "desconocido")
+            dx_text   = f"net_dx={int(net_dx)}px  {dir_text}"
+            cv2.putText(out, dx_text, (cx_last + 8, cy - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1)
+
+        return out
 
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
@@ -377,6 +493,7 @@ class CameraState:
         self.label = CAMERAS[cam_key]["label"]
         self.frame: np.ndarray | None = None
         self.process_frame: np.ndarray | None = None
+        self.overlay_frame: np.ndarray | None = None  # Cam 1 debug overlay
         self.confirmed_label: str | None = None  # e.g. "325 Entró"
         self.pending_count: int = 0              # this camera's votes in window
         self.connected: bool = False
@@ -475,6 +592,17 @@ def processor_worker(
                 print(f"  [{state.label}] ERROR: {e}")
             raw = None
 
+        # For Cam 1: update the direction debug overlay (separate try so it
+        # can never nullify a successful detection if it fails).
+        if state.label == DIRECTION_CAM:
+            try:
+                annotated = motion_filter.draw_cam1_overlay(frame)
+                with state.lock:
+                    state.overlay_frame = annotated
+            except Exception as e:
+                if debug:
+                    print(f"  [{state.label}] OVERLAY ERROR: {e}")
+
         # feed into the shared consensus buffer
         confirmed_list = global_buffer.feed(raw, state.label)
 
@@ -522,11 +650,16 @@ def _report(number: int, direction: str, frame: np.ndarray, all_states: dict) ->
 
 def render_tile(state: CameraState, global_buffer: ConsensusBuffer) -> np.ndarray:
     with state.lock:
+        overlay         = state.overlay_frame.copy() if state.overlay_frame is not None else None
         frame           = state.frame.copy() if state.frame is not None else None
         connected       = state.connected
         confirmed_label = state.confirmed_label
         cam_votes       = state.pending_count
         label           = state.label
+
+    # Cam 1: prefer the annotated overlay frame so the debug info is always visible
+    if overlay is not None:
+        frame = overlay
 
     if frame is None:
         tile = np.zeros((TILE_H, TILE_W, 3), dtype=np.uint8)
@@ -582,11 +715,14 @@ def main_loop(skip: int, confirm: int, min_window: float, max_window: float,
     while True:
         # tick: close window if it expired with no new detections coming in
         for confirmed_number, confirmed_direction in global_buffer.tick():
+            f = None
             for s in states.values():
                 with s.lock:
                     f = s.frame
                 if f is not None:
                     break
+            if f is None:
+                continue  # no frame available yet, skip capture
             _report(confirmed_number, confirmed_direction, f, states)
 
         row0 = np.hstack([render_tile(states[1], global_buffer),
