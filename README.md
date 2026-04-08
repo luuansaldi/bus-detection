@@ -12,15 +12,28 @@ Sistema de detección automática de números de flota de buses y dirección de 
 
 ## Setup
 
+Python 3.11 requerido.
+
+**Mac / Linux**
 ```bash
+python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Python 3.11, Apple Silicon recomendado (usa MPS para inferencia).
+**Windows** (PowerShell)
+```powershell
+python -m venv .venv
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+> La primera vez que corra el proyecto se descargan ~1.8 GB del modelo Moondream2 automáticamente.
 
 ## Uso rápido
 
+**Mac / Linux**
 ```bash
 # Probar en una imagen fija
 python scripts/detect_fleet.py --image test_images/frame.jpg --verbose
@@ -30,6 +43,18 @@ python scripts/rtsp_multicam.py --debug
 
 # Stream en vivo, 1 cámara (cambiar con teclas 1/2/3/4)
 python scripts/rtsp_stream.py
+```
+
+**Windows** (PowerShell)
+```powershell
+# Probar en una imagen fija
+.venv\Scripts\python scripts\detect_fleet.py --image test_images\frame.jpg --verbose
+
+# Stream en vivo, 4 cámaras simultáneas
+.venv\Scripts\python scripts\rtsp_multicam.py --debug
+
+# Stream en vivo, 1 cámara (cambiar con teclas 1/2/3/4)
+.venv\Scripts\python scripts\rtsp_stream.py
 ```
 
 ## Pipeline
