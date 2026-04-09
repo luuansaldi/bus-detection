@@ -59,16 +59,23 @@ CAM1_LINE_YELLOW_X = 0.18   # left barrier
 
 # Fallback: if no line crossing is detected, use net horizontal displacement.
 # net_dx < -MIN_DIRECTION_PX → entering (moving left), net_dx > MIN_DIRECTION_PX → exiting.
-MIN_DIRECTION_PX = 80
+MIN_DIRECTION_PX = 40
 
 # Hysteresis: direction candidate must be consistent for this many consecutive frames
 # before it's confirmed. Prevents a single noisy frame from triggering a wrong direction.
-DIRECTION_MIN_FRAMES = 3
+DIRECTION_MIN_FRAMES = 2
 
 # Minimum total displacement from first-seen position before a bus is considered
 # "active" and fed into OCR. Filters YOLO bbox jitter on parked buses — jitter
 # oscillates around the same point, real movement accumulates away from it.
-ACTIVATION_DISTANCE_PX = 60
+ACTIVATION_DISTANCE_PX = 30
+
+# Zone-based direction detection for Cam 1.
+# Zona A: exterior (derecha del frame, cx > CAM1_LINE_RED_X).
+# Zona B: interior/depósito (izquierda del frame, cx < CAM1_LINE_YELLOW_X).
+# If bus visited A first then B → entering; B first then A → exiting.
+CAM1_ZONE_A_MIN_X = CAM1_LINE_RED_X      # zona A: cx > this fraction of frame width
+CAM1_ZONE_B_MAX_X = CAM1_LINE_YELLOW_X   # zona B: cx < this fraction of frame width
 
 # Bus visible in the same slot for this many seconds without crossing either line
 # → treated as parked; will not vote in the consensus buffer.
@@ -128,6 +135,7 @@ class MotionFilter:
                 "direction_streak": 0,        # consecutive frames with same candidate
                 "first_seen_time": now,
                 "last_seen_time": now,
+                "zones_visited": [],          # ordered list of zones visited ("A", "B")
             }
             self._next_slot += 1
             return False
@@ -147,14 +155,29 @@ class MotionFilter:
         slot["ema_cx"] = alpha * cx + (1 - alpha) * slot["ema_cx"]
         slot["ema_cy"] = alpha * cy + (1 - alpha) * slot["ema_cy"]
 
-        # Line-crossing detection (Cam 1 only): record which barrier was crossed first
+        # Zone-based direction detection (Cam 1 only)
         if frame_width > 0 and slot["first_crossing"] is None:
-            red_x    = frame_width * CAM1_LINE_RED_X
-            yellow_x = frame_width * CAM1_LINE_YELLOW_X
-            if prev_cx > red_x and cx <= red_x:
-                slot["first_crossing"] = "entering"
-            elif prev_cx < yellow_x and cx >= yellow_x:
-                slot["first_crossing"] = "exiting"
+            red_x    = frame_width * CAM1_ZONE_A_MIN_X
+            yellow_x = frame_width * CAM1_ZONE_B_MAX_X
+
+            # Determine which zone the current centroid is in
+            current_zone = None
+            if cx > red_x:
+                current_zone = "A"   # exterior (right side)
+            elif cx < yellow_x:
+                current_zone = "B"   # interior/depósito (left side)
+
+            # Record zone if it's new
+            zones = slot["zones_visited"]
+            if current_zone is not None and (not zones or zones[-1] != current_zone):
+                zones.append(current_zone)
+
+            # Once both zones have been visited, determine direction by order
+            if len(zones) >= 2:
+                if zones[0] == "A" and "B" in zones:
+                    slot["first_crossing"] = "entering"   # came from outside (A) to inside (B)
+                elif zones[0] == "B" and "A" in zones:
+                    slot["first_crossing"] = "exiting"    # came from inside (B) to outside (A)
 
         slot["cx_last"] = cx
         slot["cy"] = cy
@@ -241,6 +264,14 @@ class MotionFilter:
         cv2.putText(out, "ENTRA", (red_x - 60, 20),    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255),   1)
         cv2.putText(out, "SALE",  (yellow_x + 5, 20),  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
+        # Zone overlays (semitransparent)
+        overlay_zones = out.copy()
+        cv2.rectangle(overlay_zones, (red_x, 0), (w, h), (0, 0, 255), -1)       # red = Zona A (exterior)
+        cv2.rectangle(overlay_zones, (0, 0), (yellow_x, h), (0, 255, 255), -1)  # yellow = Zona B (depósito)
+        cv2.addWeighted(overlay_zones, 0.08, out, 0.92, 0, out)
+        cv2.putText(out, "ZONA A (ext)", (red_x + 5, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+        cv2.putText(out, "ZONA B (dep)", (5, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
         now = time.monotonic()
         for slot in self._slots.values():
             # Only draw slots seen in the last 5 seconds — skip stale/parked buses
@@ -262,7 +293,8 @@ class MotionFilter:
 
             # Info text
             dir_text  = confirmed or (f"{candidate}? ({streak}/{DIRECTION_MIN_FRAMES})" if candidate else "desconocido")
-            dx_text   = f"net_dx={int(net_dx)}px  {dir_text}"
+            zones_str = "→".join(slot.get("zones_visited", []))
+            dx_text   = f"dx={int(net_dx)} zones={zones_str} {dir_text}"
             cv2.putText(out, dx_text, (cx_last + 8, cy - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1)
 
@@ -320,6 +352,8 @@ def process_frame(
     # Direction: only Cam 1 (barrier camera) can reliably distinguish entering vs exiting
     if label == DIRECTION_CAM:
         direction = motion_filter.get_direction(best) or "unknown"
+        if debug and direction != "unknown":
+            print(f"  [{label}] DIRECCIÓN DETECTADA: {direction}")
     else:
         direction = "unknown"
 
