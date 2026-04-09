@@ -63,6 +63,10 @@ def extract_full_bus_crop(
     and can locate the number anywhere in the bus image.
     """
     x1, y1, x2, y2 = detection.bbox
+    # Add horizontal padding so edge digits aren't clipped by the YOLO bbox.
+    pad_x = int((x2 - x1) * 0.08)
+    x1 = max(0, x1 - pad_x)
+    x2 = min(detection.frame_width, x2 + pad_x)
     x1 = max(0, min(x1, detection.frame_width - 1))
     y1 = max(0, min(y1, detection.frame_height - 1))
     x2 = max(0, min(x2, detection.frame_width))

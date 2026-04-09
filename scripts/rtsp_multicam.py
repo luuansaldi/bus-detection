@@ -196,7 +196,9 @@ class MotionFilter:
         if slot["first_crossing"] is None and now - slot["first_seen_time"] > PARKED_TIMEOUT_SEC:
             return False
 
-        return slot["static_count"] < self.static_limit
+        # If the EMA already confirmed real movement, don't block on per-frame threshold.
+        # static_count only blocks when the bus hasn't moved at all recently.
+        return slot["static_count"] < max(self.static_limit, 8)
 
     def get_direction(self, detection: BusDetection) -> str | None:
         """
@@ -318,10 +320,10 @@ def process_frame(
             print(f"  [{label}] YOLO: sin bus")
         return None
 
-    # Try each detection in confidence order; skip parked or too-small buses.
-    # This allows a moving bus to be processed even when a parked bus is also
-    # in frame and returned first by YOLO.
-    best = None
+    # Evaluate all detections: update motion slots for every bus, collect moving ones.
+    # Among moving buses, pick the largest bbox (closest to camera).
+    fw = frame.shape[1] if label == DIRECTION_CAM else 0
+    moving = []
     for det in detections:
         x1, y1, x2, y2 = det.bbox
         bus_w, bus_h = x2 - x1, y2 - y1
@@ -333,21 +335,25 @@ def process_frame(
         if bus_w < min_bbox or bus_h < min_bbox:
             if debug:
                 print(f"  [{label}] SKIP: bbox demasiado pequeño ({bus_w}×{bus_h}px < {min_bbox}px)")
+            # Still update motion slot even if skipped for size
+            motion_filter.is_moving(det, frame_width=fw)
             continue
 
-        # A: static bus filter — updates slot state regardless, so call for every det
-        # Pass frame_width for Cam 1 to enable virtual-line crossing detection
-        fw = frame.shape[1] if label == DIRECTION_CAM else 0
+        # A: static bus filter — always call to update slot state
         if not motion_filter.is_moving(det, frame_width=fw):
             if debug:
                 print(f"  [{label}] SKIP: bus estático (no se movió o estacionado)")
             continue
 
-        best = det
-        break  # first moving bus is enough
+        moving.append(det)
 
-    if best is None:
+    if not moving:
         return None
+
+    # Pick the moving bus closest to the camera (largest bbox area)
+    best = max(moving, key=lambda d: d.area)
+    if debug and len(moving) > 1:
+        print(f"  [{label}] {len(moving)} buses en movimiento → usando el más cercano (área={best.area}px²)")
 
     # Direction: only Cam 1 (barrier camera) can reliably distinguish entering vs exiting
     if label == DIRECTION_CAM:
@@ -364,7 +370,42 @@ def process_frame(
             if debug:
                 print(f"  [{label}] CROP: demasiado pequeño")
             return None
-        number = get_moondream_reader().read(bus_crop, cam_label=label)
+
+        # If the bus bbox covers > 40% of the frame the bus is too close and
+        # the full crop won't show the number. Split the frame into 4 quadrants
+        # and try each one — the number will be in one of the corners.
+        fh, fw = frame.shape[:2]
+        x1, y1, x2, y2 = best.bbox
+        bbox_ratio = ((x2 - x1) * (y2 - y1)) / (fw * fh)
+        if bbox_ratio > 0.40:
+            hw, hh = fw // 2, fh // 2
+            subcrops = [
+                frame[0:hh,  0:hw],       # top-left
+                frame[0:hh,  hw:fw],      # top-right
+                frame[hh:fh, 0:hw],       # bottom-left
+                frame[hh:fh, hw:fw],      # bottom-right
+            ]
+            if debug:
+                print(f"  [{label}] BUS GRANDE ({bbox_ratio:.0%} frame) → probando sub-crops")
+                # Dump crops to disk for inspection
+                dump_dir = Path(__file__).resolve().parent.parent / "captures" / "crop_debug"
+                dump_dir.mkdir(parents=True, exist_ok=True)
+                ts = datetime.now().strftime("%H%M%S_%f")[:9]
+                cv2.imwrite(str(dump_dir / f"{ts}_{label.replace(' ','')}_full.jpg"), bus_crop)
+                names = ["tl", "tr", "bl", "br"]
+                for name, sc in zip(names, subcrops):
+                    cv2.imwrite(str(dump_dir / f"{ts}_{label.replace(' ','')}_sub_{name}.jpg"), sc)
+                print(f"  [{label}] DUMP → captures/crop_debug/{ts}_{label.replace(' ','')}_*.jpg")
+            number = get_moondream_reader().read_subcrops(subcrops)
+        else:
+            number = get_moondream_reader().read(bus_crop, cam_label=label)
+            if debug and number is None:
+                # Dump normal crop too for comparison
+                dump_dir = Path(__file__).resolve().parent.parent / "captures" / "crop_debug"
+                dump_dir.mkdir(parents=True, exist_ok=True)
+                ts = datetime.now().strftime("%H%M%S_%f")[:9]
+                cv2.imwrite(str(dump_dir / f"{ts}_{label.replace(' ','')}_normal.jpg"), bus_crop)
+
         if debug:
             print(f"  [{label}] MOONDREAM: {number if number else 'none'} dir={direction}")
         return (number, direction) if number else None
@@ -595,14 +636,12 @@ def processor_worker(
     state: CameraState,
     global_buffer: ConsensusBuffer,
     all_states: dict,
+    detector: BusDetector,
     min_bbox: int,
     debug: bool = False,
     ocr_backend: str = "claude",
 ) -> None:
     motion_filter = MotionFilter()
-
-    print(f"[INFO] {state.label}: cargando modelo YOLO ...")
-    detector = BusDetector()
     print(f"[INFO] {state.label}: listo.")
 
     while True:
@@ -733,13 +772,17 @@ def main_loop(skip: int, confirm: int, min_window: float, max_window: float,
     states = {k: CameraState(k) for k in CAMERAS}
     global_buffer = ConsensusBuffer(min_window_sec=min_window, max_window_sec=max_window, min_votes=confirm)
 
+    print("[INFO] Cargando modelo YOLO (instancia compartida) ...")
+    detector = BusDetector()
+    print(f"[INFO] YOLO listo en {detector._device}.")
+
     for k, state in states.items():
         threading.Thread(target=reader_worker,
                          args=(state, skip, fps_cap), daemon=True).start()
         # excluded cameras: start reader (to show video) but no processor
         if k not in exclude:
             threading.Thread(target=processor_worker,
-                             args=(state, global_buffer, states, min_bbox, debug, ocr_backend),
+                             args=(state, global_buffer, states, detector, min_bbox, debug, ocr_backend),
                              daemon=True).start()
         else:
             print(f"[INFO] {state.label}: solo video, sin detección (excluida)")

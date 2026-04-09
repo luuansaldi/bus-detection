@@ -8,8 +8,11 @@ Only the COCO "bus" class (id=5) is returned.
 from dataclasses import dataclass
 from pathlib import Path
 
+import threading
+
 import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
 
 from config.settings import YOLO_BUS_CLASS_IDS, YOLO_MIN_CONFIDENCE, YOLO_MODEL
@@ -53,7 +56,10 @@ class BusDetector:
     ) -> None:
         self.min_confidence = min_confidence
         self.class_ids = class_ids
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
         self._model = YOLO(model_path)
+        self._model.to(self._device)
+        self._lock = threading.Lock()
 
     def detect(self, image: np.ndarray) -> list[BusDetection]:
         """
@@ -64,12 +70,14 @@ class BusDetector:
         """
         frame_h, frame_w = image.shape[:2]
 
-        results = self._model(
-            image,
-            classes=self.class_ids,
-            conf=self.min_confidence,
-            verbose=False,
-        )
+        with self._lock:
+            results = self._model(
+                image,
+                classes=self.class_ids,
+                conf=self.min_confidence,
+                verbose=False,
+                device=self._device,
+            )
 
         detections: list[BusDetection] = []
 
