@@ -157,6 +157,10 @@ class MoondreamReader:
                 enc = self._model.encode_image(pil_img)
                 answer = self._model.answer_question(enc, _QUERY, self._tokenizer)
 
+            import torch
+            if self._device == "cuda":
+                torch.cuda.empty_cache()
+
             return _parse(answer)
 
         except Exception as e:

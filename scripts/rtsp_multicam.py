@@ -46,6 +46,9 @@ CAMERAS = {
     4: {"channel": 13, "label": "Cam 4"},
 }
 
+# Cameras active for detection
+ACTIVE_CAMS = {1, 2, 3, 4}
+
 TILE_W = 640
 TILE_H = 360
 
@@ -66,7 +69,6 @@ EXCLUDE_ZONES: dict[str, list[tuple[float, float, float, float]]] = {
 # Cam 4 (rear view): sees rear of entering buses, front of exiting buses.
 ORIENTATION_TO_DIRECTION: dict[str, dict[str, str]] = {
     "Cam 1": {"front": "exiting", "rear": "entering"},
-    "Cam 2": {"front": "exiting", "rear": "entering"},
 }
 
 # Virtual barrier lines for Cam 1, as a fraction of frame width.
@@ -193,9 +195,9 @@ class MotionFilter:
             # Once both zones have been visited, determine direction by order
             if len(zones) >= 2:
                 if zones[0] == "A" and "B" in zones:
-                    slot["first_crossing"] = "entering"   # came from outside (A) to inside (B)
+                    slot["first_crossing"] = "entering"   # A (right/exterior) → B (left/depot) = entering
                 elif zones[0] == "B" and "A" in zones:
-                    slot["first_crossing"] = "exiting"    # came from inside (B) to outside (A)
+                    slot["first_crossing"] = "exiting"    # B (left/depot) → A (right/exterior) = exiting
 
         slot["cx_last"] = cx
         slot["cy"] = cy
@@ -372,8 +374,13 @@ def process_frame(
             motion_filter.is_moving(det, frame_width=fw)
             continue
 
+        # Freeze zone tracking when bus fills most of the frame — cx is near center
+        # and not reliable for direction detection.
+        det_ratio = (bus_w * bus_h) / (fw_frame * fh_frame)
+        fw_for_motion = 0 if (fw > 0 and det_ratio > 0.60) else fw
+
         # A: static bus filter — always call to update slot state
-        if not motion_filter.is_moving(det, frame_width=fw):
+        if not motion_filter.is_moving(det, frame_width=fw_for_motion):
             if debug:
                 print(f"  [{label}] SKIP: bus estático (no se movió o estacionado)")
             continue
@@ -684,58 +691,60 @@ def yolo_worker(
     print(f"[INFO] {state.label}: listo.")
 
     while True:
-        state.process_event.wait()
-        state.process_event.clear()
-
-        with state.lock:
-            frame = state.process_frame
-        if frame is None:
-            continue
-
         try:
-            best, bus_crop, bbox_ratio = _yolo_detect(
-                frame, detector, motion_filter, min_bbox,
-                label=state.label, debug=debug,
-            )
-        except Exception as e:
-            if debug:
-                print(f"  [{state.label}] YOLO ERROR: {e}")
-            best, bus_crop, bbox_ratio = None, None, 0.0
+            state.process_event.wait()
+            state.process_event.clear()
 
-        # Update Cam 1 direction overlay regardless of OCR
-        if state.label == DIRECTION_CAM:
+            with state.lock:
+                frame = state.process_frame
+            if frame is None:
+                continue
+
             try:
-                annotated = motion_filter.draw_cam1_overlay(frame)
+                best, bus_crop, bbox_ratio = _yolo_detect(
+                    frame, detector, motion_filter, min_bbox,
+                    label=state.label, debug=debug,
+                )
             except Exception as e:
-                if debug:
+                print(f"  [{state.label}] YOLO ERROR: {e}")
+                best, bus_crop, bbox_ratio = None, None, 0.0
+
+            # Update Cam 1 direction overlay regardless of OCR
+            if state.label == DIRECTION_CAM:
+                try:
+                    annotated = motion_filter.draw_cam1_overlay(frame)
+                except Exception as e:
                     print(f"  [{state.label}] OVERLAY ERROR: {e}")
-                annotated = None
+                    annotated = None
+                with state.lock:
+                    state.overlay_frame = annotated
+                    state.overlay_ts = time.monotonic()
+
+            if best is None or bus_crop is None:
+                # No moving bus — clear overlay so display falls back to live frame
+                if state.label != DIRECTION_CAM:
+                    with state.lock:
+                        state.overlay_frame = None
+                        state.overlay_ts = time.monotonic()
+                continue
+
+            # Draw green bbox immediately (don't wait for Moondream)
+            x1, y1, x2, y2 = best.bbox
+            annotated = frame.copy()
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
             with state.lock:
                 state.overlay_frame = annotated
                 state.overlay_ts = time.monotonic()
 
-        if best is None or bus_crop is None:
-            # No moving bus — clear overlay so display falls back to live frame
-            if state.label != DIRECTION_CAM:
-                with state.lock:
-                    state.overlay_frame = None
-                    state.overlay_ts = time.monotonic()
-            continue
+            # Hand off to OCR worker — drop if busy (queue full = stale crop)
+            try:
+                state.ocr_queue.put_nowait((bus_crop, best, frame, bbox_ratio))
+            except queue.Full:
+                if debug:
+                    print(f"  [{state.label}] OCR ocupado, descartando crop")
 
-        # Draw green bbox immediately (don't wait for Moondream)
-        x1, y1, x2, y2 = best.bbox
-        annotated = frame.copy()
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        with state.lock:
-            state.overlay_frame = annotated
-            state.overlay_ts = time.monotonic()
-
-        # Hand off to OCR worker — drop if busy (queue full = stale crop)
-        try:
-            state.ocr_queue.put_nowait((bus_crop, best, frame, bbox_ratio))
-        except queue.Full:
-            if debug:
-                print(f"  [{state.label}] OCR ocupado, descartando crop")
+        except Exception as e:
+            print(f"  [{state.label}] YOLO WORKER ERROR (thread vivo): {e}")
 
 
 def _yolo_detect(
@@ -787,7 +796,12 @@ def _yolo_detect(
             motion_filter.is_moving(det, frame_width=fw)
             continue
 
-        if not motion_filter.is_moving(det, frame_width=fw):
+        # Freeze zone tracking when bus fills most of the frame — cx is near center
+        # and not reliable for direction detection.
+        det_ratio = (bus_w * bus_h) / (fw_frame * fh_frame)
+        fw_for_motion = 0 if (fw > 0 and det_ratio > 0.60) else fw
+
+        if not motion_filter.is_moving(det, frame_width=fw_for_motion):
             if debug:
                 print(f"  [{label}] SKIP: bus estático (no se movió o estacionado)")
             continue
@@ -828,31 +842,34 @@ def ocr_worker(
     Runs independently of YOLO so YOLO is never blocked waiting for OCR.
     """
     while True:
-        bus_crop, best, frame, bbox_ratio = state.ocr_queue.get()
-        label = state.label
-        fh, fw = frame.shape[:2]
-
         try:
-            raw = _run_ocr(
-                bus_crop, best, frame, bbox_ratio, fw, fh,
-                motion_filter, label, debug, ocr_backend,
-            )
-        except Exception as e:
-            if debug:
+            bus_crop, best, frame, bbox_ratio = state.ocr_queue.get()
+            label = state.label
+            fh, fw = frame.shape[:2]
+
+            try:
+                raw = _run_ocr(
+                    bus_crop, best, frame, bbox_ratio, fw, fh,
+                    motion_filter, label, debug, ocr_backend,
+                )
+            except Exception as e:
                 print(f"  [{label}] OCR ERROR: {e}")
-            raw = None
+                raw = None
 
-        events = global_buffer.feed(raw, label)
+            events = global_buffer.feed(raw, label)
 
-        if debug and raw is not None:
-            votes = global_buffer.all_votes()
-            print(f"  [{label}] VOTO: {raw}  |  votos en ventana: {votes}")
+            if debug and raw is not None:
+                votes = global_buffer.all_votes()
+                print(f"  [{label}] VOTO: {raw}  |  votos en ventana: {votes}")
 
-        for event in events:
-            _handle_event(event, frame, all_states)
+            for event in events:
+                _handle_event(event, frame, all_states)
 
-        with state.lock:
-            state.pending_count = global_buffer.vote_count(label)
+            with state.lock:
+                state.pending_count = global_buffer.vote_count(label)
+
+        except Exception as e:
+            print(f"  [{state.label}] OCR WORKER ERROR (thread vivo): {e}")
 
 
 def _run_ocr(bus_crop, best, frame, bbox_ratio, fw, fh,
@@ -907,10 +924,14 @@ def _run_ocr(bus_crop, best, frame, bbox_ratio, fw, fh,
         direction = "unknown"
     elif label in ORIENTATION_TO_DIRECTION:
         number, orientation = get_moondream_reader().read_with_orientation(bus_crop, cam_label=label)
-        orientation_map = ORIENTATION_TO_DIRECTION[label]
-        direction = orientation_map.get(orientation or "", "unknown")
-        if direction == "unknown":
-            direction = motion_filter.get_direction(best) or "unknown"
+        # MotionFilter zone crossing is the primary direction signal (more reliable).
+        # Moondream orientation is fallback only when MotionFilter has no result yet.
+        motion_direction = motion_filter.get_direction(best)
+        if motion_direction:
+            direction = motion_direction
+        else:
+            orientation_map = ORIENTATION_TO_DIRECTION[label]
+            direction = orientation_map.get(orientation or "", "unknown")
         if debug and number is None:
             dump_dir = Path(__file__).resolve().parent.parent / "captures" / "crop_debug"
             dump_dir.mkdir(parents=True, exist_ok=True)
@@ -1043,8 +1064,8 @@ def main_loop(skip: int, confirm: int, min_window: float, max_window: float,
     for k, state in states.items():
         threading.Thread(target=reader_worker,
                          args=(state, skip, fps_cap), daemon=True).start()
-        # excluded cameras: start reader (to show video) but no detection
-        if k not in exclude:
+        # excluded cameras or inactive cams: reader only, no detection
+        if k not in exclude and k in ACTIVE_CAMS:
             motion_filter = MotionFilter()
             threading.Thread(target=yolo_worker,
                              args=(state, detector, motion_filter, min_bbox, debug),
