@@ -66,11 +66,18 @@ filters/candidate_filter.py      EasyOCR path only — select_best()
 
 ## Live stream architecture (`rtsp_multicam.py`)
 
-Two threads per camera: **reader** (reads frames continuously, never blocks) + **processor** (runs the pipeline on queued frames). A single `ConsensusBuffer` is shared across all 4 processor threads.
+Three threads per camera: **reader** + **yolo_worker** + **ocr_worker**. A single `ConsensusBuffer` is shared across all camera threads.
+
+- **reader**: reads frames from RTSP continuously, stores latest in `state.frame`, queues every Nth frame for YOLO via `state.process_event`.
+- **yolo_worker**: runs YOLO + `MotionFilter` on every queued frame. When a moving bus is found, puts the crop into `state.ocr_queue` (maxsize=1 — drops stale crops if OCR is busy) and updates the display overlay immediately.
+- **ocr_worker**: blocks on `state.ocr_queue`, runs Moondream (or EasyOCR) on the crop, feeds result to `ConsensusBuffer`. Runs independently so YOLO is never blocked by OCR inference.
+
+This decoupling means YOLO tracks buses at full frame rate regardless of how long Moondream takes.
 
 - `MotionFilter` (per camera): skips buses that haven't moved > 50px between detections (ignores parked buses). Also tracks net horizontal displacement for direction detection.
 - `ConsensusBuffer`: opens a time window (default 2–6s) on first detection, collects votes from all cameras, closes early once min_votes are reached. Per-number cooldown (10s) prevents re-reporting the same bus.
 - RTSP transport is forced to TCP via `OPENCV_FFMPEG_CAPTURE_OPTIONS` set before `import cv2`.
+- `overlay_frame` expires after 0.5s (`OVERLAY_MAX_AGE`) so the display always falls back to the live reader frame rather than freezing on the last detected bus.
 
 ## Direction detection
 
@@ -99,6 +106,7 @@ Minimum net displacement to assign a direction: `MIN_DIRECTION_PX = 80`.
 | `YOLO_MIN_CONFIDENCE` | 0.40 | |
 | `YOLO_BUS_CLASS_IDS` | `[5, 7]` | 5=bus, 7=truck (rear close-ups sometimes classified as truck) |
 | `FLEET_MIN` / `FLEET_MAX` | 10 / 1500 | |
+| `FLEET_BLACKLIST` | `{90}` | Numbers explicitly rejected (e.g. speed limit signs painted on buses) |
 | `FLEET_YEAR_THRESHOLD` | 2000 | 4-digit numbers ≥ this are rejected as years (not applicable given max=1500) |
 | `OCR_MIN_CONFIDENCE` | 0.65 | EasyOCR path only |
 | `CLAUDE_OCR_MODEL` | `claude-haiku-4-5-20251001` | Unused in current default flow |

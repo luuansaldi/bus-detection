@@ -77,10 +77,11 @@ La dirección se determina por el desplazamiento horizontal neto del bus a trav�
 
 ## Arquitectura multi-cámara
 
-`rtsp_multicam.py` corre 2 hilos por cámara:
+`rtsp_multicam.py` corre 3 hilos por cámara:
 
 - **reader**: lee frames del stream RTSP continuamente
-- **processor**: corre el pipeline de detección sobre los frames encolados
+- **yolo_worker**: corre YOLO en cada frame; cuando detecta un bus en movimiento envía el crop al hilo de OCR sin bloquearse
+- **ocr_worker**: recibe crops de YOLO y corre Moondream de forma asíncrona, independiente del rate de YOLO
 
 Un `ConsensusBuffer` compartido acumula votos de las 4 cámaras en una ventana de tiempo (2–6s). El número que alcanza el mínimo de votos se confirma. Cooldown de 10s por número para evitar re-reportar el mismo bus.
 
@@ -115,6 +116,7 @@ Cada bus confirmado se guarda en `captures/` como `YYYYMMDD_HHMMSS_<numero>_<dir
 |-----------|-------|-------------|
 | `YOLO_MODEL` | `yolov8m.pt` | Modelo YOLO — `n` es más rápido, `m` más preciso |
 | `FLEET_MIN/MAX` | 10 / 1500 | Rango válido de números de flota |
+| `FLEET_BLACKLIST` | `{90}` | Números descartados explícitamente (ej: señales de velocidad máxima pintadas en el bus) |
 | `YOLO_MIN_CONFIDENCE` | 0.40 | Umbral mínimo de confianza YOLO |
 
 Ver `config/settings.py` para todos los parámetros.
