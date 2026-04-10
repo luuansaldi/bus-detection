@@ -114,3 +114,35 @@ Minimum net displacement to assign a direction: `MIN_DIRECTION_PX = 80`.
 ## Captured images
 
 Confirmed detections are saved to `captures/` as `YYYYMMDD_HHMMSS_<number>_<direction>.jpg` (direction tag omitted if unknown).
+
+---
+
+## Estado actual del proyecto (2026-04-10)
+
+### Ramas
+| Rama | Responsable | Propósito |
+|------|-------------|-----------|
+| `main` | — | Base estable |
+| `interfaz-web` | Lucia | Interfaz web para integrar el sistema |
+| `cambios-direcciones-deteccion` | Compañero | Mejoras en detección y dirección |
+
+### Infraestructura
+- **IP cámaras (externa):** `190.220.138.178:34224`
+- **Credenciales RTSP:** `test:fono1234`
+- **Canales:** Cam 1 → ch1, Cam 2 → ch5, Cam 3 → ch9, Cam 4 → ch13
+
+### Qué funciona
+- Pipeline completo: YOLO → Moondream OCR → ConsensusBuffer → captura
+- 4 cámaras en paralelo con threads separados (reader / yolo_worker / ocr_worker)
+- Detección de dirección por zona en Cam 1 (barrera): zona A (exterior) → zona B (depósito) = entrando; inverso = saliendo
+- Blacklist de número 90 (carteles de límite de velocidad pintados en buses)
+
+### Pendiente / en progreso
+- Validar dirección en vivo con buses reales cruzando Cam 1
+- Interfaz web (`interfaz-web`): por iniciar
+- Mejoras de detección (`cambios-direcciones-deteccion`): en progreso por compañero
+
+### Cómo correr
+```bash
+cd fonobus && .venv/bin/python scripts/rtsp_multicam.py --debug
+```

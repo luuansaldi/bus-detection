@@ -35,8 +35,10 @@ from roi.extractor import extract_rois, extract_full_bus_crop
 from preprocessing.image_processor import process
 from ocr.reader import read_candidates
 from filters.candidate_filter import select_best
+from web.database import init_db, insertar as db_insertar
+from web.app import emit_event
 
-BASE_URL = "rtsp://test:fono1234@192.168.1.63:34224/cam/realmonitor"
+BASE_URL = "rtsp://test:fono1234@190.220.138.178:34224/cam/realmonitor"
 RECONNECT_DELAY = 5
 
 CAMERAS = {
@@ -639,11 +641,13 @@ def reader_worker(state: CameraState, skip: int, fps_cap: int) -> None:
             if not cap.isOpened():
                 with state.lock:
                     state.connected = False
+                emit_event({"type": "camera_status", "cam": state.label, "connected": False})
                 time.sleep(RECONNECT_DELAY)
                 continue
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # minimize lag — always show latest frame
             with state.lock:
                 state.connected = True
+            emit_event({"type": "camera_status", "cam": state.label, "connected": True})
             frame_count = 0
 
         t0 = time.monotonic()
@@ -654,6 +658,7 @@ def reader_worker(state: CameraState, skip: int, fps_cap: int) -> None:
             cap = None
             with state.lock:
                 state.connected = False
+            emit_event({"type": "camera_status", "cam": state.label, "connected": False})
             continue
 
         frame_count += 1
@@ -994,6 +999,14 @@ def _report(number: int, direction: str, frame: np.ndarray, all_states: dict) ->
     tag = f"_{direction}" if direction != "unknown" else ""
     filename = captures_dir / f"{ts_file}_{number}{tag}.jpg"
     cv2.imwrite(str(filename), frame)
+    db_insertar(number, direction, str(filename))
+    emit_event({
+        "type": "detection",
+        "timestamp": ts_log,
+        "numero_flota": number,
+        "direccion": direction,
+        "imagen_path": str(filename),
+    })
 
     for s in all_states.values():
         with s.lock:
@@ -1049,17 +1062,40 @@ def render_tile(state: CameraState, global_buffer: ConsensusBuffer) -> np.ndarra
     return tile
 
 
+# ── Web server (background thread) ───────────────────────────────────────────
+
+def _start_web_server(host: str = "0.0.0.0", port: int = 8000) -> None:
+    """Arranca el servidor FastAPI en un thread de fondo. No bloquea."""
+    import uvicorn
+
+    config = uvicorn.Config("web.app:app", host=host, port=port, log_level="warning")
+    server = uvicorn.Server(config)
+
+    t = threading.Thread(target=server.run, daemon=True, name="web-server")
+    t.start()
+    print(f"[INFO] Servidor web en http://localhost:{port}/api/detecciones")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main_loop(skip: int, confirm: int, min_window: float, max_window: float,
               fps_cap: int, min_bbox: int, debug: bool, exclude: set[int],
               ocr_backend: str = "moondream") -> None:
+    init_db()
+    _start_web_server()
     states = {k: CameraState(k) for k in CAMERAS}
     global_buffer = ConsensusBuffer(max_window_sec=max_window, number_cooldown_sec=10.0)
 
     print("[INFO] Cargando modelo YOLO (instancia compartida) ...")
     detector = BusDetector()
     print(f"[INFO] YOLO listo en {detector._device}.")
+
+    from ocr.moondream_reader import get_moondream_reader
+    print("[INFO] Precargando Moondream ...")
+    _reader = get_moondream_reader()
+    if _reader._model is None:
+        _reader._load()
+    print("[INFO] Moondream listo.")
 
     for k, state in states.items():
         threading.Thread(target=reader_worker,
