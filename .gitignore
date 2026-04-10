@@ -20,3 +20,4 @@ captures/
 # IDE
 .idea/
 .vscode/
+detecciones.db

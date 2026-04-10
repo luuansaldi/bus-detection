@@ -38,7 +38,7 @@ from filters.candidate_filter import select_best
 from web.database import init_db, insertar as db_insertar
 from web.app import emit_event
 
-BASE_URL = "rtsp://test:fono1234@190.220.138.178:34224/cam/realmonitor"
+BASE_URL = "rtsp://test:fono1234@192.168.1.63:34224/cam/realmonitor"
 RECONNECT_DELAY = 5
 
 CAMERAS = {
@@ -499,7 +499,7 @@ class ConsensusBuffer:
 
     Events are 4-tuples: (event_type, number, direction, extra)
       provisional : (type, number, direction, cam_label)
-      confirmed   : (type, number, direction, None)
+      confirmed   : (type, number, direction, first_crop)
       conflict    : (type, first_number, direction, second_number)
     """
 
@@ -510,9 +510,10 @@ class ConsensusBuffer:
         self._votes: list[tuple[int, str, str]] = []  # (number, direction, cam_label)
         self._window_start: float | None = None
         self._reported: dict[int, float] = {}
+        self._first_crop = None   # crop saved at first vote for confirmed capture
         self._lock = threading.Lock()
 
-    def feed(self, result: tuple[int, str] | None, cam_label: str) -> list[tuple]:
+    def feed(self, result: tuple[int, str] | None, cam_label: str, crop=None) -> list[tuple]:
         now = time.monotonic()
         events: list[tuple] = []
         with self._lock:
@@ -522,6 +523,7 @@ class ConsensusBuffer:
                     number, direction = result
                     self._window_start = now
                     self._votes = [(number, direction, cam_label)]
+                    self._first_crop = crop   # save crop at first sighting
                     events.append(("provisional", number, direction, cam_label))
             else:
                 # Window already open
@@ -572,9 +574,12 @@ class ConsensusBuffer:
         if not distinct:
             # All votes agree
             self._reported[winner] = now
-            return [("confirmed", winner, direction, None)]
+            crop = self._first_crop
+            self._first_crop = None
+            return [("confirmed", winner, direction, crop)]
         else:
             # Conflict: return most-voted competing number as extra
+            self._first_crop = None
             rival = max(distinct, key=counts.__getitem__)
             return [("conflict", winner, direction, rival)]
 
@@ -861,7 +866,7 @@ def ocr_worker(
                 print(f"  [{label}] OCR ERROR: {e}")
                 raw = None
 
-            events = global_buffer.feed(raw, label)
+            events = global_buffer.feed(raw, label, crop=bus_crop)
 
             if debug and raw is not None:
                 votes = global_buffer.all_votes()
@@ -971,8 +976,8 @@ def _handle_event(event: tuple, frame, all_states: dict) -> None:
             with s.lock:
                 s.confirmed_label = label
     elif event_type == "confirmed":
-        _, number, direction, _ = event
-        _report(number, direction, frame, all_states)
+        _, number, direction, first_crop = event
+        _report(number, direction, first_crop if first_crop is not None else frame, all_states)
     elif event_type == "conflict":
         _, first_number, direction, rival = event
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

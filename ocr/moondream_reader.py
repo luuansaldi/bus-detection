@@ -189,6 +189,10 @@ class MoondreamReader:
         except Exception as e:
             print(f"[Moondream] ERROR subcrop: {e}")
             return None
+        finally:
+            if self._device == "cuda":
+                import torch
+                torch.cuda.empty_cache()
 
     def read_with_orientation(
         self, crop_bgr: np.ndarray, cam_label: str = ""
@@ -227,10 +231,17 @@ class MoondreamReader:
             else:
                 orientation = None
 
+            if self._device == "cuda":
+                import torch
+                torch.cuda.empty_cache()
+
             return number, orientation
 
         except Exception as e:
             print(f"[Moondream] ERROR: {e}")
+            if self._device == "cuda":
+                import torch
+                torch.cuda.empty_cache()
             return None, None
 
 
