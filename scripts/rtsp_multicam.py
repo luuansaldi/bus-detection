@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import queue
 import sys
 import threading
 import time
@@ -35,7 +36,7 @@ from preprocessing.image_processor import process
 from ocr.reader import read_candidates
 from filters.candidate_filter import select_best
 
-BASE_URL = "rtsp://test:fono1234@190.220.138.178:34224/cam/realmonitor"
+BASE_URL = "rtsp://test:fono1234@192.168.1.63:34224/cam/realmonitor"
 RECONNECT_DELAY = 5
 
 CAMERAS = {
@@ -50,6 +51,23 @@ TILE_H = 360
 
 # Cam 1 is at the barrier — the only camera where direction is unambiguous.
 DIRECTION_CAM = "Cam 1"
+
+# Per-camera exclusion zones: detections whose center falls inside are ignored
+# completely (no MotionFilter slot created). Coordinates as fractions of frame size.
+# Format: cam_label → list of (x1_frac, y1_frac, x2_frac, y2_frac)
+# Cam 3: upper-right area where 3 parked patio buses always sit.
+EXCLUDE_ZONES: dict[str, list[tuple[float, float, float, float]]] = {
+    "Cam 3": [(0.35, 0.00, 1.00, 0.50)],
+}
+
+# Cameras that detect direction via Moondream orientation (single call, same crop).
+# Maps cam_label → {"front": direction, "rear": direction}
+# Cam 1 (barrier): front of bus = entering, rear = exiting.
+# Cam 4 (rear view): sees rear of entering buses, front of exiting buses.
+ORIENTATION_TO_DIRECTION: dict[str, dict[str, str]] = {
+    "Cam 1": {"front": "exiting", "rear": "entering"},
+    "Cam 2": {"front": "exiting", "rear": "entering"},
+}
 
 # Virtual barrier lines for Cam 1, as a fraction of frame width.
 # A bus whose center crosses the RED line first is entering (comes from outside/right).
@@ -196,7 +214,9 @@ class MotionFilter:
         if slot["first_crossing"] is None and now - slot["first_seen_time"] > PARKED_TIMEOUT_SEC:
             return False
 
-        return slot["static_count"] < self.static_limit
+        # If the EMA already confirmed real movement, don't block on per-frame threshold.
+        # static_count only blocks when the bus hasn't moved at all recently.
+        return slot["static_count"] < max(self.static_limit, 8)
 
     def get_direction(self, detection: BusDetection) -> str | None:
         """
@@ -311,51 +331,62 @@ def process_frame(
     label: str = "",
     debug: bool = False,
     ocr_backend: str = "claude",
-) -> int | None:
+) -> tuple[tuple | None, tuple | None]:
+    """Returns (result, bbox) where bbox is (x1,y1,x2,y2) of the bus sent to OCR."""
     detections = detector.detect(frame)
     if not detections:
         if debug:
             print(f"  [{label}] YOLO: sin bus")
-        return None
+        return None, None
 
-    # Try each detection in confidence order; skip parked or too-small buses.
-    # This allows a moving bus to be processed even when a parked bus is also
-    # in frame and returned first by YOLO.
-    best = None
+    # Evaluate all detections: update motion slots for every bus, collect moving ones.
+    # Among moving buses, pick the largest bbox (closest to camera).
+    fh_frame, fw_frame = frame.shape[:2]
+    fw = fw_frame if label == DIRECTION_CAM else 0
+    exclusions = EXCLUDE_ZONES.get(label, [])
+    moving = []
     for det in detections:
         x1, y1, x2, y2 = det.bbox
         bus_w, bus_h = x2 - x1, y2 - y1
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
 
         if debug:
             print(f"  [{label}] YOLO: bus conf={det.confidence:.2f} bbox=({x1},{y1})-({x2},{y2})")
+
+        # Exclusion zones: skip detections whose center is in a masked area
+        excluded = any(
+            ex1 * fw_frame <= cx <= ex2 * fw_frame and
+            ey1 * fh_frame <= cy <= ey2 * fh_frame
+            for ex1, ey1, ex2, ey2 in exclusions
+        )
+        if excluded:
+            if debug:
+                print(f"  [{label}] SKIP: zona excluida ({cx:.0f},{cy:.0f})")
+            continue
 
         # B: minimum bbox size
         if bus_w < min_bbox or bus_h < min_bbox:
             if debug:
                 print(f"  [{label}] SKIP: bbox demasiado pequeño ({bus_w}×{bus_h}px < {min_bbox}px)")
+            # Still update motion slot even if skipped for size
+            motion_filter.is_moving(det, frame_width=fw)
             continue
 
-        # A: static bus filter — updates slot state regardless, so call for every det
-        # Pass frame_width for Cam 1 to enable virtual-line crossing detection
-        fw = frame.shape[1] if label == DIRECTION_CAM else 0
+        # A: static bus filter — always call to update slot state
         if not motion_filter.is_moving(det, frame_width=fw):
             if debug:
                 print(f"  [{label}] SKIP: bus estático (no se movió o estacionado)")
             continue
 
-        best = det
-        break  # first moving bus is enough
+        moving.append(det)
 
-    if best is None:
-        return None
+    if not moving:
+        return None, None
 
-    # Direction: only Cam 1 (barrier camera) can reliably distinguish entering vs exiting
-    if label == DIRECTION_CAM:
-        direction = motion_filter.get_direction(best) or "unknown"
-        if debug and direction != "unknown":
-            print(f"  [{label}] DIRECCIÓN DETECTADA: {direction}")
-    else:
-        direction = "unknown"
+    # Pick the moving bus closest to the camera (largest bbox area)
+    best = max(moving, key=lambda d: d.area)
+    if debug and len(moving) > 1:
+        print(f"  [{label}] {len(moving)} buses en movimiento → usando el más cercano (área={best.area}px²)")
 
     if ocr_backend == "moondream":
         from ocr.moondream_reader import get_moondream_reader
@@ -363,18 +394,66 @@ def process_frame(
         if bus_crop is None:
             if debug:
                 print(f"  [{label}] CROP: demasiado pequeño")
-            return None
-        number = get_moondream_reader().read(bus_crop, cam_label=label)
+            return None, None
+
+        # If the bus bbox covers > 40% of the frame the bus is too close and
+        # the full crop won't show the number. Split the frame into 4 quadrants
+        # and try each one — the number will be in one of the corners.
+        fh, fw = frame.shape[:2]
+        x1, y1, x2, y2 = best.bbox
+        bbox_ratio = ((x2 - x1) * (y2 - y1)) / (fw * fh)
+        if bbox_ratio > 0.60 and label in ORIENTATION_TO_DIRECTION:
+            # Cam 1 / Cam 2: bus too close, number not readable. Skip OCR and let
+            # the other camera handle it. Direction still tracked via MotionFilter.
+            if debug:
+                print(f"  [{label}] BUS GRANDE ({bbox_ratio:.0%} frame) → skip OCR, bus demasiado cerca")
+            direction = motion_filter.get_direction(best) or "unknown"
+            return None, best.bbox
+        elif bbox_ratio > 0.60:
+            # Cam 3 (OCR-only): bus large but still try sub-crops — no other cam to rely on.
+            hw, hh = fw // 2, fh // 2
+            subcrops = [
+                frame[0:hh,  0:hw],
+                frame[0:hh,  hw:fw],
+                frame[hh:fh, 0:hw],
+                frame[hh:fh, hw:fw],
+            ]
+            if debug:
+                print(f"  [{label}] BUS GRANDE ({bbox_ratio:.0%} frame) → probando sub-crops")
+            number = get_moondream_reader().read_subcrops(subcrops)
+            direction = "unknown"
+        elif label in ORIENTATION_TO_DIRECTION:
+            # Single call: read number + orientation, then map orientation → direction.
+            number, orientation = get_moondream_reader().read_with_orientation(bus_crop, cam_label=label)
+            orientation_map = ORIENTATION_TO_DIRECTION[label]
+            direction = orientation_map.get(orientation or "", "unknown")
+            # Moondream couldn't determine orientation — fall back to MotionFilter
+            if direction == "unknown":
+                direction = motion_filter.get_direction(best) or "unknown"
+            if debug and number is None:
+                dump_dir = Path(__file__).resolve().parent.parent / "captures" / "crop_debug"
+                dump_dir.mkdir(parents=True, exist_ok=True)
+                ts = datetime.now().strftime("%H%M%S_%f")[:9]
+                cv2.imwrite(str(dump_dir / f"{ts}_{label.replace(' ','')}_normal.jpg"), bus_crop)
+        else:
+            number = get_moondream_reader().read(bus_crop, cam_label=label)
+            direction = "unknown"
+            if debug and number is None:
+                dump_dir = Path(__file__).resolve().parent.parent / "captures" / "crop_debug"
+                dump_dir.mkdir(parents=True, exist_ok=True)
+                ts = datetime.now().strftime("%H%M%S_%f")[:9]
+                cv2.imwrite(str(dump_dir / f"{ts}_{label.replace(' ','')}_normal.jpg"), bus_crop)
+
         if debug:
             print(f"  [{label}] MOONDREAM: {number if number else 'none'} dir={direction}")
-        return (number, direction) if number else None
+        return ((number, direction) if number else None), best.bbox
 
     # ── EasyOCR path (legacy) ──────────────────────────────────────────────
     crops = extract_rois(frame, best)
     if not crops:
         if debug:
             print(f"  [{label}] ROI: sin crops válidos")
-        return None
+        return None, None
 
     all_candidates = []
     for crop in crops:
@@ -395,77 +474,70 @@ def process_frame(
             print(f"  [{label}] RESULTADO: {result.number} (score={result.score:.2f})")
         else:
             print(f"  [{label}] RESULTADO: descartado por filtro")
-    return (result.number, direction) if result else None
+    return ((result.number, direction) if result else None), best.bbox
 
 
 # ── Consensus buffer (shared across all cameras) ──────────────────────────────
 
 class ConsensusBuffer:
     """
-    Adaptive voting window: opens on first detection, closes early once
-    min_votes are reached (after min_window_sec), or after max_window_sec.
+    Two-step detection flow:
+      1. First vote → emits a "provisional" event immediately (shown on HUD).
+      2. Window closes (on second confirming vote or timeout) → emits:
+           "confirmed"  if all votes agree on the same number
+           "conflict"   if votes disagree (logs an error, no save)
+    Cooldown is PER NUMBER (applies only to confirmed events).
 
-    Supports multiple simultaneous buses (e.g. one entering, one exiting):
-    each distinct bus number that reaches min_votes is confirmed independently.
-    Votes carry direction ("entering"/"exiting"/"unknown"); majority direction wins.
-    Cooldown is PER NUMBER.
+    Events are 4-tuples: (event_type, number, direction, extra)
+      provisional : (type, number, direction, cam_label)
+      confirmed   : (type, number, direction, None)
+      conflict    : (type, first_number, direction, second_number)
     """
 
-    def __init__(self, min_window_sec: float = 2.0, max_window_sec: float = 6.0,
-                 min_votes: int = 2, number_cooldown_sec: float = 10.0):
-        self.min_window_sec      = min_window_sec
+    def __init__(self, max_window_sec: float = 6.0, number_cooldown_sec: float = 10.0):
         self.max_window_sec      = max_window_sec
-        self.min_votes           = min_votes
         self.number_cooldown_sec = number_cooldown_sec
 
         self._votes: list[tuple[int, str, str]] = []  # (number, direction, cam_label)
         self._window_start: float | None = None
-        self._reported: dict[int, float] = {}          # number → last reported timestamp
+        self._reported: dict[int, float] = {}
         self._lock = threading.Lock()
 
-    def feed(self, result: tuple[int, str] | None, cam_label: str) -> list[tuple[int, str]]:
+    def feed(self, result: tuple[int, str] | None, cam_label: str) -> list[tuple]:
         now = time.monotonic()
+        events: list[tuple] = []
         with self._lock:
-            if self._window_start is not None:
+            if self._window_start is None:
+                # No window open — first vote opens it and emits provisional
+                if result is not None:
+                    number, direction = result
+                    self._window_start = now
+                    self._votes = [(number, direction, cam_label)]
+                    events.append(("provisional", number, direction, cam_label))
+            else:
+                # Window already open
                 if result is not None:
                     number, direction = result
                     self._votes.append((number, direction, cam_label))
-                elapsed = now - self._window_start
-                if elapsed >= self.min_window_sec:
-                    counts: dict[int, int] = {}
-                    for n, _, _ in self._votes:
-                        counts[n] = counts.get(n, 0) + 1
-                    if max(counts.values(), default=0) >= self.min_votes:
-                        return self._close(now)
-                if elapsed >= self.max_window_sec:
-                    return self._close(now)
-                return []
+                    # Close immediately on second vote from a different camera
+                    cams_voted = {lbl for _, _, lbl in self._votes}
+                    if len(cams_voted) >= 2:
+                        events.extend(self._close(now))
+                elif now - self._window_start >= self.max_window_sec:
+                    events.extend(self._close(now))
+        return events
 
-            if result is not None:
-                number, direction = result
-                self._window_start = now
-                self._votes = [(number, direction, cam_label)]
-
-        return []
-
-    def tick(self) -> list[tuple[int, str]]:
+    def tick(self) -> list[tuple]:
         """Close expired window even when no new detections arrive."""
         now = time.monotonic()
         with self._lock:
-            if self._window_start is not None:
-                elapsed = now - self._window_start
-                if elapsed >= self.min_window_sec:
-                    counts: dict[int, int] = {}
-                    for n, _, _ in self._votes:
-                        counts[n] = counts.get(n, 0) + 1
-                    if max(counts.values(), default=0) >= self.min_votes:
-                        return self._close(now)
-                if elapsed >= self.max_window_sec:
-                    return self._close(now)
+            if (self._window_start is not None and
+                    now - self._window_start >= self.max_window_sec):
+                return self._close(now)
         return []
 
-    def _close(self, now: float) -> list[tuple[int, str]]:
-        """Confirm all numbers that reached min_votes. Must be called with lock held."""
+    def _close(self, now: float) -> list[tuple]:
+        """Evaluate votes and emit confirmed or conflict. Called with lock held."""
         votes = self._votes
         self._votes = []
         self._window_start = None
@@ -473,27 +545,29 @@ class ConsensusBuffer:
         if not votes:
             return []
 
-        # Count votes and collect direction votes per number
+        # Majority number
         counts: dict[int, int] = {}
-        dir_votes: dict[int, dict[str, int]] = {}
-        for n, d, _ in votes:
+        for n, _, _ in votes:
             counts[n] = counts.get(n, 0) + 1
-            dir_votes.setdefault(n, {})
-            dir_votes[n][d] = dir_votes[n].get(d, 0) + 1
+        winner = max(counts, key=counts.__getitem__)
+        distinct = [n for n in counts if n != winner]
 
-        confirmed: list[tuple[int, str]] = []
-        for n in sorted(counts, key=lambda x: counts[x], reverse=True):
-            if counts[n] < self.min_votes:
-                continue
-            last = self._reported.get(n, 0.0)
-            if now - last < self.number_cooldown_sec:
-                continue
-            real_dir_votes = {d: c for d, c in dir_votes[n].items() if d != "unknown"}
-            majority_dir = max(real_dir_votes, key=real_dir_votes.get) if real_dir_votes else "unknown"
-            self._reported[n] = now
-            confirmed.append((n, majority_dir))
+        # Direction: majority non-unknown across all votes for the winner
+        dir_votes = [d for n, d, _ in votes if n == winner and d != "unknown"]
+        direction = max(set(dir_votes), key=dir_votes.count) if dir_votes else "unknown"
 
-        return confirmed
+        last = self._reported.get(winner, 0.0)
+        if now - last < self.number_cooldown_sec:
+            return []
+
+        if not distinct:
+            # All votes agree
+            self._reported[winner] = now
+            return [("confirmed", winner, direction, None)]
+        else:
+            # Conflict: return most-voted competing number as extra
+            rival = max(distinct, key=counts.__getitem__)
+            return [("conflict", winner, direction, rival)]
 
     @property
     def window_active(self) -> bool:
@@ -528,12 +602,16 @@ class CameraState:
         self.frame: np.ndarray | None = None
         self.process_frame: np.ndarray | None = None
         self.overlay_frame: np.ndarray | None = None  # Cam 1 debug overlay
+        self.overlay_ts: float = 0.0
         self.confirmed_label: str | None = None  # e.g. "325 Entró"
         self.pending_count: int = 0              # this camera's votes in window
         self.connected: bool = False
         self.lock = threading.Lock()
         self.process_event = threading.Event()
         self.last_capture: np.ndarray | None = None
+        # OCR queue: YOLO puts (crop, best_detection, frame) here; Moondream worker consumes.
+        # maxsize=1 so we always process the freshest crop and drop stale ones.
+        self.ocr_queue: queue.Queue = queue.Queue(maxsize=1)
 
 
 # ── Reader thread ─────────────────────────────────────────────────────────────
@@ -589,20 +667,20 @@ def reader_worker(state: CameraState, skip: int, fps_cap: int) -> None:
             time.sleep(remaining)
 
 
-# ── Processor thread ──────────────────────────────────────────────────────────
+# ── YOLO worker (fast, runs every frame) ─────────────────────────────────────
 
-def processor_worker(
+def yolo_worker(
     state: CameraState,
-    global_buffer: ConsensusBuffer,
-    all_states: dict,
+    detector: BusDetector,
+    motion_filter: MotionFilter,
     min_bbox: int,
     debug: bool = False,
-    ocr_backend: str = "claude",
 ) -> None:
-    motion_filter = MotionFilter()
-
-    print(f"[INFO] {state.label}: cargando modelo YOLO ...")
-    detector = BusDetector()
+    """
+    Runs YOLO on every queued frame as fast as possible.
+    When a moving bus is found, puts the crop + context into state.ocr_queue
+    for the OCR worker to pick up. Drops the crop if OCR is still busy (queue full).
+    """
     print(f"[INFO] {state.label}: listo.")
 
     while True:
@@ -611,48 +689,269 @@ def processor_worker(
 
         with state.lock:
             frame = state.process_frame
-
         if frame is None:
             continue
 
         try:
-            raw = process_frame(
-                frame, detector, motion_filter,
-                min_bbox=min_bbox, label=state.label, debug=debug,
-                ocr_backend=ocr_backend,
+            best, bus_crop, bbox_ratio = _yolo_detect(
+                frame, detector, motion_filter, min_bbox,
+                label=state.label, debug=debug,
             )
         except Exception as e:
             if debug:
-                print(f"  [{state.label}] ERROR: {e}")
-            raw = None
+                print(f"  [{state.label}] YOLO ERROR: {e}")
+            best, bus_crop, bbox_ratio = None, None, 0.0
 
-        # For Cam 1: update the direction debug overlay (separate try so it
-        # can never nullify a successful detection if it fails).
+        # Update Cam 1 direction overlay regardless of OCR
         if state.label == DIRECTION_CAM:
             try:
                 annotated = motion_filter.draw_cam1_overlay(frame)
-                with state.lock:
-                    state.overlay_frame = annotated
             except Exception as e:
                 if debug:
                     print(f"  [{state.label}] OVERLAY ERROR: {e}")
+                annotated = None
+            with state.lock:
+                state.overlay_frame = annotated
+                state.overlay_ts = time.monotonic()
 
-        # feed into the shared consensus buffer
-        confirmed_list = global_buffer.feed(raw, state.label)
+        if best is None or bus_crop is None:
+            # No moving bus — clear overlay so display falls back to live frame
+            if state.label != DIRECTION_CAM:
+                with state.lock:
+                    state.overlay_frame = None
+                    state.overlay_ts = time.monotonic()
+            continue
+
+        # Draw green bbox immediately (don't wait for Moondream)
+        x1, y1, x2, y2 = best.bbox
+        annotated = frame.copy()
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        with state.lock:
+            state.overlay_frame = annotated
+            state.overlay_ts = time.monotonic()
+
+        # Hand off to OCR worker — drop if busy (queue full = stale crop)
+        try:
+            state.ocr_queue.put_nowait((bus_crop, best, frame, bbox_ratio))
+        except queue.Full:
+            if debug:
+                print(f"  [{state.label}] OCR ocupado, descartando crop")
+
+
+def _yolo_detect(
+    frame,
+    detector: BusDetector,
+    motion_filter: MotionFilter,
+    min_bbox: int,
+    label: str = "",
+    debug: bool = False,
+):
+    """
+    Run YOLO + MotionFilter. Returns (best_detection, bus_crop, bbox_ratio) or
+    (None, None, 0) if no moving bus found worth sending to OCR.
+    """
+    from roi.extractor import extract_full_bus_crop
+
+    detections = detector.detect(frame)
+    if not detections:
+        if debug:
+            print(f"  [{label}] YOLO: sin bus")
+        return None, None, 0.0
+
+    fh_frame, fw_frame = frame.shape[:2]
+    fw = fw_frame if label == DIRECTION_CAM else 0
+    exclusions = EXCLUDE_ZONES.get(label, [])
+    moving = []
+
+    for det in detections:
+        x1, y1, x2, y2 = det.bbox
+        bus_w, bus_h = x2 - x1, y2 - y1
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+
+        if debug:
+            print(f"  [{label}] YOLO: bus conf={det.confidence:.2f} bbox=({x1},{y1})-({x2},{y2})")
+
+        excluded = any(
+            ex1 * fw_frame <= cx <= ex2 * fw_frame and
+            ey1 * fh_frame <= cy <= ey2 * fh_frame
+            for ex1, ey1, ex2, ey2 in exclusions
+        )
+        if excluded:
+            if debug:
+                print(f"  [{label}] SKIP: zona excluida ({cx:.0f},{cy:.0f})")
+            continue
+
+        if bus_w < min_bbox or bus_h < min_bbox:
+            if debug:
+                print(f"  [{label}] SKIP: bbox demasiado pequeño ({bus_w}×{bus_h}px < {min_bbox}px)")
+            motion_filter.is_moving(det, frame_width=fw)
+            continue
+
+        if not motion_filter.is_moving(det, frame_width=fw):
+            if debug:
+                print(f"  [{label}] SKIP: bus estático (no se movió o estacionado)")
+            continue
+
+        moving.append(det)
+
+    if not moving:
+        return None, None, 0.0
+
+    best = max(moving, key=lambda d: d.area)
+    if debug and len(moving) > 1:
+        print(f"  [{label}] {len(moving)} buses en movimiento → usando el más cercano (área={best.area}px²)")
+
+    bus_crop = extract_full_bus_crop(frame, best)
+    if bus_crop is None:
+        if debug:
+            print(f"  [{label}] CROP: demasiado pequeño")
+        return None, None, 0.0
+
+    fh, fw2 = frame.shape[:2]
+    x1, y1, x2, y2 = best.bbox
+    bbox_ratio = ((x2 - x1) * (y2 - y1)) / (fw2 * fh)
+    return best, bus_crop, bbox_ratio
+
+
+# ── OCR worker (Moondream, async) ─────────────────────────────────────────────
+
+def ocr_worker(
+    state: CameraState,
+    global_buffer: ConsensusBuffer,
+    all_states: dict,
+    motion_filter: MotionFilter,
+    debug: bool = False,
+    ocr_backend: str = "moondream",
+) -> None:
+    """
+    Consumes crops from state.ocr_queue and runs Moondream OCR.
+    Runs independently of YOLO so YOLO is never blocked waiting for OCR.
+    """
+    while True:
+        bus_crop, best, frame, bbox_ratio = state.ocr_queue.get()
+        label = state.label
+        fh, fw = frame.shape[:2]
+
+        try:
+            raw = _run_ocr(
+                bus_crop, best, frame, bbox_ratio, fw, fh,
+                motion_filter, label, debug, ocr_backend,
+            )
+        except Exception as e:
+            if debug:
+                print(f"  [{label}] OCR ERROR: {e}")
+            raw = None
+
+        events = global_buffer.feed(raw, label)
 
         if debug and raw is not None:
             votes = global_buffer.all_votes()
-            print(f"  [{state.label}] VOTO: {raw}  |  votos en ventana: {votes}")
+            print(f"  [{label}] VOTO: {raw}  |  votos en ventana: {votes}")
 
-        for confirmed_number, confirmed_direction in confirmed_list:
-            _report(confirmed_number, confirmed_direction, frame, all_states)
+        for event in events:
+            _handle_event(event, frame, all_states)
 
-        # update this camera's vote count for the HUD
         with state.lock:
-            state.pending_count = global_buffer.vote_count(state.label)
+            state.pending_count = global_buffer.vote_count(label)
+
+
+def _run_ocr(bus_crop, best, frame, bbox_ratio, fw, fh,
+             motion_filter, label, debug, ocr_backend):
+    """Runs the OCR backend and returns (number, direction) or None."""
+    if ocr_backend != "moondream":
+        # EasyOCR legacy path
+        from roi.extractor import extract_rois
+        crops = extract_rois(frame, best)
+        if not crops:
+            if debug:
+                print(f"  [{label}] ROI: sin crops válidos")
+            return None
+        all_candidates = []
+        for crop in crops:
+            variants = process(crop.image)
+            for variant in variants:
+                candidates = read_candidates(variant.image, crop.zone_name, variant.name)
+                if debug and candidates:
+                    for c in candidates:
+                        print(f"  [{label}] OCR: zona={c.zone_name} texto='{c.text}' conf={c.confidence:.2f}")
+                all_candidates.extend(candidates)
+        if debug and not all_candidates:
+            print(f"  [{label}] OCR: sin candidatos")
+        result = select_best(all_candidates)
+        if debug:
+            if result:
+                print(f"  [{label}] RESULTADO: {result.number} (score={result.score:.2f})")
+            else:
+                print(f"  [{label}] RESULTADO: descartado por filtro")
+        direction = motion_filter.get_direction(best) or "unknown"
+        return (result.number, direction) if result else None
+
+    from ocr.moondream_reader import get_moondream_reader
+
+    if bbox_ratio > 0.60 and label in ORIENTATION_TO_DIRECTION:
+        if debug:
+            print(f"  [{label}] BUS GRANDE ({bbox_ratio:.0%} frame) → skip OCR, bus demasiado cerca")
+        direction = motion_filter.get_direction(best) or "unknown"
+        return None
+    elif bbox_ratio > 0.60:
+        hw, hh = fw // 2, fh // 2
+        subcrops = [
+            frame[0:hh,  0:hw],
+            frame[0:hh,  hw:fw],
+            frame[hh:fh, 0:hw],
+            frame[hh:fh, hw:fw],
+        ]
+        if debug:
+            print(f"  [{label}] BUS GRANDE ({bbox_ratio:.0%} frame) → probando sub-crops")
+        number = get_moondream_reader().read_subcrops(subcrops)
+        direction = "unknown"
+    elif label in ORIENTATION_TO_DIRECTION:
+        number, orientation = get_moondream_reader().read_with_orientation(bus_crop, cam_label=label)
+        orientation_map = ORIENTATION_TO_DIRECTION[label]
+        direction = orientation_map.get(orientation or "", "unknown")
+        if direction == "unknown":
+            direction = motion_filter.get_direction(best) or "unknown"
+        if debug and number is None:
+            dump_dir = Path(__file__).resolve().parent.parent / "captures" / "crop_debug"
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%H%M%S_%f")[:9]
+            cv2.imwrite(str(dump_dir / f"{ts}_{label.replace(' ','')}_normal.jpg"), bus_crop)
+    else:
+        number = get_moondream_reader().read(bus_crop, cam_label=label)
+        direction = "unknown"
+        if debug and number is None:
+            dump_dir = Path(__file__).resolve().parent.parent / "captures" / "crop_debug"
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%H%M%S_%f")[:9]
+            cv2.imwrite(str(dump_dir / f"{ts}_{label.replace(' ','')}_normal.jpg"), bus_crop)
+
+    if debug:
+        print(f"  [{label}] MOONDREAM: {number if number else 'none'} dir={direction}")
+    return (number, direction) if number else None
 
 
 # ── Report helper ────────────────────────────────────────────────────────────
+
+def _handle_event(event: tuple, frame, all_states: dict) -> None:
+    event_type = event[0]
+    if event_type == "provisional":
+        _, number, direction, cam_label = event
+        action = {"entering": "entrando", "exiting": "saliendo"}.get(direction, "")
+        suffix = f" ({action})" if action else ""
+        print(f"[provisional] Bus {number}{suffix} — visto por {cam_label}, esperando confirmación...")
+        # Update HUD on all tiles
+        label = f"{number} {action}".strip()
+        for s in all_states.values():
+            with s.lock:
+                s.confirmed_label = label
+    elif event_type == "confirmed":
+        _, number, direction, _ = event
+        _report(number, direction, frame, all_states)
+    elif event_type == "conflict":
+        _, first_number, direction, rival = event
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{ts}] ⚠️  CONFLICTO: primera lectura={first_number}, segunda lectura={rival} — descartado")
+
 
 def _report(number: int, direction: str, frame: np.ndarray, all_states: dict) -> None:
     ts_log  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -682,16 +981,20 @@ def _report(number: int, direction: str, frame: np.ndarray, all_states: dict) ->
 
 # ── Tile rendering ────────────────────────────────────────────────────────────
 
+OVERLAY_MAX_AGE = 0.5  # segundos — si el overlay es más viejo que esto, mostrar frame en vivo
+
 def render_tile(state: CameraState, global_buffer: ConsensusBuffer) -> np.ndarray:
+    now = time.monotonic()
     with state.lock:
-        overlay         = state.overlay_frame.copy() if state.overlay_frame is not None else None
+        fresh           = state.overlay_frame is not None and (now - state.overlay_ts) < OVERLAY_MAX_AGE
+        overlay         = state.overlay_frame.copy() if fresh else None
         frame           = state.frame.copy() if state.frame is not None else None
         connected       = state.connected
         confirmed_label = state.confirmed_label
         cam_votes       = state.pending_count
         label           = state.label
 
-    # Cam 1: prefer the annotated overlay frame so the debug info is always visible
+    # Use overlay only while fresh — otherwise show live frame
     if overlay is not None:
         frame = overlay
 
@@ -731,15 +1034,23 @@ def main_loop(skip: int, confirm: int, min_window: float, max_window: float,
               fps_cap: int, min_bbox: int, debug: bool, exclude: set[int],
               ocr_backend: str = "moondream") -> None:
     states = {k: CameraState(k) for k in CAMERAS}
-    global_buffer = ConsensusBuffer(min_window_sec=min_window, max_window_sec=max_window, min_votes=confirm)
+    global_buffer = ConsensusBuffer(max_window_sec=max_window, number_cooldown_sec=10.0)
+
+    print("[INFO] Cargando modelo YOLO (instancia compartida) ...")
+    detector = BusDetector()
+    print(f"[INFO] YOLO listo en {detector._device}.")
 
     for k, state in states.items():
         threading.Thread(target=reader_worker,
                          args=(state, skip, fps_cap), daemon=True).start()
-        # excluded cameras: start reader (to show video) but no processor
+        # excluded cameras: start reader (to show video) but no detection
         if k not in exclude:
-            threading.Thread(target=processor_worker,
-                             args=(state, global_buffer, states, min_bbox, debug, ocr_backend),
+            motion_filter = MotionFilter()
+            threading.Thread(target=yolo_worker,
+                             args=(state, detector, motion_filter, min_bbox, debug),
+                             daemon=True).start()
+            threading.Thread(target=ocr_worker,
+                             args=(state, global_buffer, states, motion_filter, debug, ocr_backend),
                              daemon=True).start()
         else:
             print(f"[INFO] {state.label}: solo video, sin detección (excluida)")
@@ -748,16 +1059,14 @@ def main_loop(skip: int, confirm: int, min_window: float, max_window: float,
 
     while True:
         # tick: close window if it expired with no new detections coming in
-        for confirmed_number, confirmed_direction in global_buffer.tick():
+        for event in global_buffer.tick():
             f = None
             for s in states.values():
                 with s.lock:
                     f = s.frame
                 if f is not None:
                     break
-            if f is None:
-                continue  # no frame available yet, skip capture
-            _report(confirmed_number, confirmed_direction, f, states)
+            _handle_event(event, f, states)
 
         row0 = np.hstack([render_tile(states[1], global_buffer),
                           render_tile(states[2], global_buffer)])

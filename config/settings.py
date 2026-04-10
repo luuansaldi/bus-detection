@@ -18,6 +18,9 @@ OCR_MIN_CONFIDENCE = 0.65
 FLEET_MIN = 10
 FLEET_MAX = 1500
 
+# Numbers explicitly blacklisted — common false positives (e.g. speed limit signs)
+FLEET_BLACKLIST = {90}
+
 # 4-digit numbers >= this value are assumed to be years — not applicable with max=1500
 FLEET_YEAR_THRESHOLD = 2000
 

@@ -15,25 +15,29 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from config.settings import FLEET_MAX, FLEET_MIN, FLEET_YEAR_THRESHOLD
+from config.settings import FLEET_MAX, FLEET_MIN, FLEET_YEAR_THRESHOLD, FLEET_BLACKLIST
 
 _MODEL_ID = "vikhyatk/moondream2"
 _REVISION = "2024-08-26"
 
 _QUERY = (
     "This image is a crop from a CCTV camera at a bus depot. "
-    "STEP 1 — Identify the vehicle: the buses in this depot are passenger coaches, "
-    "typically white with green or pink details, or all black, and usually display the word 'FONO' or 'FONO BUS' on the body. "
+    "STEP 1 — Identify the vehicle: the buses in this depot are FONO BUS passenger coaches, "
+    "typically white with green or pink details, or all black. "
     "If the main vehicle visible is a fuel tanker, cistern truck, cargo truck, pickup, or car — reply with 'none'. "
     "Also reply 'none' if a truck or tanker is blocking most of the bus making the number unclear. "
-    "STEP 2 — If it IS a FONO BUS passenger coach, find the fleet number painted on it. "
-    "The fleet number is a number between 10 and 1500 (examples: 30, 325, 764, 1022). "
+    "STEP 2 — If it IS a FONO BUS passenger coach, find the FLEET NUMBER. "
+    "IMPORTANT: 'FONO BUS' is the company name/brand — it is NOT the fleet number. Ignore it completely. "
+    "The fleet number is a small number between 10 and 1500 painted separately from the branding (examples: 30, 325, 731, 764, 1022). "
     "Depending on the camera angle, look here: "
-    "REAR view: upper or lower section of the rear panel. "
+    "REAR view: lower section of the rear panel, near the bumper or below the rear window. "
     "FRONT view: lower-left or lower-right corner near the bumper. "
-    "LATERAL view: bottom-right or bottom-left of the side body, below the door or below the driver window. "
-    "Ignore numbers from street signs, license plates, capacity markings, or timestamps. "
-    "Reply with ONLY the fleet number, or 'none' if unsure."
+    "LATERAL view: check all four lower corners of the visible side — "
+    "lower-rear-right, lower-rear-left, lower-front-right, lower-front-left — "
+    "the number may appear near the rear wheel arch, below the driver window, below the door, or near the front bumper corner. "
+    "Ignore: the brand name 'FONO BUS', street signs, license plates, capacity markings, timestamps, "
+    "and speed limit markings (e.g. '90' painted on the upper lateral). "
+    "Reply with ONLY the fleet number digits, or 'none' if you cannot find it."
 )
 
 _ORIENTATION_QUERY = (
@@ -44,11 +48,21 @@ _ORIENTATION_QUERY = (
 
 _DIGIT_RE = re.compile(r"\b(\d{1,4})\b")
 
+# Common OCR confusions: letter → digit
+_OCR_FIXES = str.maketrans("GgOoSsBbIilZz", "6600558811122")
+
+
+def _normalize_ocr(text: str) -> str:
+    """Replace letters commonly misread instead of digits."""
+    return text.translate(_OCR_FIXES)
+
 
 def _validate(value: int) -> bool:
     if not (FLEET_MIN <= value <= FLEET_MAX):
         return False
     if len(str(value)) == 4 and value >= FLEET_YEAR_THRESHOLD:
+        return False
+    if value in FLEET_BLACKLIST:
         return False
     return True
 
@@ -57,6 +71,7 @@ def _parse(text: str) -> int | None:
     text = text.strip().lower()
     if text == "none":
         return None
+    text = _normalize_ocr(text)
     try:
         value = int(text)
         return value if _validate(value) else None
@@ -146,6 +161,29 @@ class MoondreamReader:
 
         except Exception as e:
             print(f"[Moondream] ERROR: {e}")
+            return None
+
+    def read_subcrops(self, crops: list[np.ndarray]) -> int | None:
+        """
+        Try multiple crops in sequence (no rate limit).
+        Returns the first valid fleet number found, or None.
+        Used as fallback when the bus bbox covers most of the frame.
+        """
+        try:
+            with self._infer_lock:
+                if self._model is None:
+                    self._load()
+                for crop in crops:
+                    rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                    pil_img = Image.fromarray(rgb)
+                    enc = self._model.encode_image(pil_img)
+                    answer = self._model.answer_question(enc, _QUERY, self._tokenizer)
+                    result = _parse(answer)
+                    if result is not None:
+                        return result
+            return None
+        except Exception as e:
+            print(f"[Moondream] ERROR subcrop: {e}")
             return None
 
     def read_with_orientation(
