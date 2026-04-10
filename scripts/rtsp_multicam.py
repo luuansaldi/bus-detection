@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import queue
 import sys
 import threading
 import time
@@ -35,13 +36,14 @@ from preprocessing.image_processor import process
 from ocr.reader import read_candidates
 from filters.candidate_filter import select_best
 
-BASE_URL = "rtsp://test:fono1234@190.220.138.178:34224/cam/realmonitor"
+BASE_URL = "rtsp://test:fono1234@192.168.1.63:34224/cam/realmonitor"
 RECONNECT_DELAY = 5
 
 CAMERAS = {
     1: {"channel": 1,  "label": "Cam 1"},
     2: {"channel": 5,  "label": "Cam 2"},
     3: {"channel": 9,  "label": "Cam 3"},
+    4: {"channel": 13, "label": "Cam 4"},
 }
 
 TILE_W = 640
@@ -600,12 +602,16 @@ class CameraState:
         self.frame: np.ndarray | None = None
         self.process_frame: np.ndarray | None = None
         self.overlay_frame: np.ndarray | None = None  # Cam 1 debug overlay
+        self.overlay_ts: float = 0.0
         self.confirmed_label: str | None = None  # e.g. "325 Entró"
         self.pending_count: int = 0              # this camera's votes in window
         self.connected: bool = False
         self.lock = threading.Lock()
         self.process_event = threading.Event()
         self.last_capture: np.ndarray | None = None
+        # OCR queue: YOLO puts (crop, best_detection, frame) here; Moondream worker consumes.
+        # maxsize=1 so we always process the freshest crop and drop stale ones.
+        self.ocr_queue: queue.Queue = queue.Queue(maxsize=1)
 
 
 # ── Reader thread ─────────────────────────────────────────────────────────────
@@ -661,18 +667,20 @@ def reader_worker(state: CameraState, skip: int, fps_cap: int) -> None:
             time.sleep(remaining)
 
 
-# ── Processor thread ──────────────────────────────────────────────────────────
+# ── YOLO worker (fast, runs every frame) ─────────────────────────────────────
 
-def processor_worker(
+def yolo_worker(
     state: CameraState,
-    global_buffer: ConsensusBuffer,
-    all_states: dict,
     detector: BusDetector,
+    motion_filter: MotionFilter,
     min_bbox: int,
     debug: bool = False,
-    ocr_backend: str = "claude",
 ) -> None:
-    motion_filter = MotionFilter()
+    """
+    Runs YOLO on every queued frame as fast as possible.
+    When a moving bus is found, puts the crop + context into state.ocr_queue
+    for the OCR worker to pick up. Drops the crop if OCR is still busy (queue full).
+    """
     print(f"[INFO] {state.label}: listo.")
 
     while True:
@@ -681,53 +689,245 @@ def processor_worker(
 
         with state.lock:
             frame = state.process_frame
-
         if frame is None:
             continue
 
         try:
-            raw, det_bbox = process_frame(
-                frame, detector, motion_filter,
-                min_bbox=min_bbox, label=state.label, debug=debug,
-                ocr_backend=ocr_backend,
+            best, bus_crop, bbox_ratio = _yolo_detect(
+                frame, detector, motion_filter, min_bbox,
+                label=state.label, debug=debug,
             )
         except Exception as e:
             if debug:
-                print(f"  [{state.label}] ERROR: {e}")
-            raw, det_bbox = None, None
+                print(f"  [{state.label}] YOLO ERROR: {e}")
+            best, bus_crop, bbox_ratio = None, None, 0.0
 
-        # Draw green box around the bus being tracked by Moondream
-        if det_bbox is not None:
-            x1, y1, x2, y2 = det_bbox
-            annotated = frame.copy()
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            with state.lock:
-                state.overlay_frame = annotated
-
-        # For Cam 1: update the direction debug overlay (separate try so it
-        # can never nullify a successful detection if it fails).
+        # Update Cam 1 direction overlay regardless of OCR
         if state.label == DIRECTION_CAM:
             try:
                 annotated = motion_filter.draw_cam1_overlay(frame)
-                with state.lock:
-                    state.overlay_frame = annotated
             except Exception as e:
                 if debug:
                     print(f"  [{state.label}] OVERLAY ERROR: {e}")
+                annotated = None
+            with state.lock:
+                state.overlay_frame = annotated
+                state.overlay_ts = time.monotonic()
 
-        # feed into the shared consensus buffer
-        events = global_buffer.feed(raw, state.label)
+        if best is None or bus_crop is None:
+            # No moving bus — clear overlay so display falls back to live frame
+            if state.label != DIRECTION_CAM:
+                with state.lock:
+                    state.overlay_frame = None
+                    state.overlay_ts = time.monotonic()
+            continue
+
+        # Draw green bbox immediately (don't wait for Moondream)
+        x1, y1, x2, y2 = best.bbox
+        annotated = frame.copy()
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        with state.lock:
+            state.overlay_frame = annotated
+            state.overlay_ts = time.monotonic()
+
+        # Hand off to OCR worker — drop if busy (queue full = stale crop)
+        try:
+            state.ocr_queue.put_nowait((bus_crop, best, frame, bbox_ratio))
+        except queue.Full:
+            if debug:
+                print(f"  [{state.label}] OCR ocupado, descartando crop")
+
+
+def _yolo_detect(
+    frame,
+    detector: BusDetector,
+    motion_filter: MotionFilter,
+    min_bbox: int,
+    label: str = "",
+    debug: bool = False,
+):
+    """
+    Run YOLO + MotionFilter. Returns (best_detection, bus_crop, bbox_ratio) or
+    (None, None, 0) if no moving bus found worth sending to OCR.
+    """
+    from roi.extractor import extract_full_bus_crop
+
+    detections = detector.detect(frame)
+    if not detections:
+        if debug:
+            print(f"  [{label}] YOLO: sin bus")
+        return None, None, 0.0
+
+    fh_frame, fw_frame = frame.shape[:2]
+    fw = fw_frame if label == DIRECTION_CAM else 0
+    exclusions = EXCLUDE_ZONES.get(label, [])
+    moving = []
+
+    for det in detections:
+        x1, y1, x2, y2 = det.bbox
+        bus_w, bus_h = x2 - x1, y2 - y1
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+
+        if debug:
+            print(f"  [{label}] YOLO: bus conf={det.confidence:.2f} bbox=({x1},{y1})-({x2},{y2})")
+
+        excluded = any(
+            ex1 * fw_frame <= cx <= ex2 * fw_frame and
+            ey1 * fh_frame <= cy <= ey2 * fh_frame
+            for ex1, ey1, ex2, ey2 in exclusions
+        )
+        if excluded:
+            if debug:
+                print(f"  [{label}] SKIP: zona excluida ({cx:.0f},{cy:.0f})")
+            continue
+
+        if bus_w < min_bbox or bus_h < min_bbox:
+            if debug:
+                print(f"  [{label}] SKIP: bbox demasiado pequeño ({bus_w}×{bus_h}px < {min_bbox}px)")
+            motion_filter.is_moving(det, frame_width=fw)
+            continue
+
+        if not motion_filter.is_moving(det, frame_width=fw):
+            if debug:
+                print(f"  [{label}] SKIP: bus estático (no se movió o estacionado)")
+            continue
+
+        moving.append(det)
+
+    if not moving:
+        return None, None, 0.0
+
+    best = max(moving, key=lambda d: d.area)
+    if debug and len(moving) > 1:
+        print(f"  [{label}] {len(moving)} buses en movimiento → usando el más cercano (área={best.area}px²)")
+
+    bus_crop = extract_full_bus_crop(frame, best)
+    if bus_crop is None:
+        if debug:
+            print(f"  [{label}] CROP: demasiado pequeño")
+        return None, None, 0.0
+
+    fh, fw2 = frame.shape[:2]
+    x1, y1, x2, y2 = best.bbox
+    bbox_ratio = ((x2 - x1) * (y2 - y1)) / (fw2 * fh)
+    return best, bus_crop, bbox_ratio
+
+
+# ── OCR worker (Moondream, async) ─────────────────────────────────────────────
+
+def ocr_worker(
+    state: CameraState,
+    global_buffer: ConsensusBuffer,
+    all_states: dict,
+    motion_filter: MotionFilter,
+    debug: bool = False,
+    ocr_backend: str = "moondream",
+) -> None:
+    """
+    Consumes crops from state.ocr_queue and runs Moondream OCR.
+    Runs independently of YOLO so YOLO is never blocked waiting for OCR.
+    """
+    while True:
+        bus_crop, best, frame, bbox_ratio = state.ocr_queue.get()
+        label = state.label
+        fh, fw = frame.shape[:2]
+
+        try:
+            raw = _run_ocr(
+                bus_crop, best, frame, bbox_ratio, fw, fh,
+                motion_filter, label, debug, ocr_backend,
+            )
+        except Exception as e:
+            if debug:
+                print(f"  [{label}] OCR ERROR: {e}")
+            raw = None
+
+        events = global_buffer.feed(raw, label)
 
         if debug and raw is not None:
             votes = global_buffer.all_votes()
-            print(f"  [{state.label}] VOTO: {raw}  |  votos en ventana: {votes}")
+            print(f"  [{label}] VOTO: {raw}  |  votos en ventana: {votes}")
 
         for event in events:
             _handle_event(event, frame, all_states)
 
-        # update this camera's vote count for the HUD
         with state.lock:
-            state.pending_count = global_buffer.vote_count(state.label)
+            state.pending_count = global_buffer.vote_count(label)
+
+
+def _run_ocr(bus_crop, best, frame, bbox_ratio, fw, fh,
+             motion_filter, label, debug, ocr_backend):
+    """Runs the OCR backend and returns (number, direction) or None."""
+    if ocr_backend != "moondream":
+        # EasyOCR legacy path
+        from roi.extractor import extract_rois
+        crops = extract_rois(frame, best)
+        if not crops:
+            if debug:
+                print(f"  [{label}] ROI: sin crops válidos")
+            return None
+        all_candidates = []
+        for crop in crops:
+            variants = process(crop.image)
+            for variant in variants:
+                candidates = read_candidates(variant.image, crop.zone_name, variant.name)
+                if debug and candidates:
+                    for c in candidates:
+                        print(f"  [{label}] OCR: zona={c.zone_name} texto='{c.text}' conf={c.confidence:.2f}")
+                all_candidates.extend(candidates)
+        if debug and not all_candidates:
+            print(f"  [{label}] OCR: sin candidatos")
+        result = select_best(all_candidates)
+        if debug:
+            if result:
+                print(f"  [{label}] RESULTADO: {result.number} (score={result.score:.2f})")
+            else:
+                print(f"  [{label}] RESULTADO: descartado por filtro")
+        direction = motion_filter.get_direction(best) or "unknown"
+        return (result.number, direction) if result else None
+
+    from ocr.moondream_reader import get_moondream_reader
+
+    if bbox_ratio > 0.60 and label in ORIENTATION_TO_DIRECTION:
+        if debug:
+            print(f"  [{label}] BUS GRANDE ({bbox_ratio:.0%} frame) → skip OCR, bus demasiado cerca")
+        direction = motion_filter.get_direction(best) or "unknown"
+        return None
+    elif bbox_ratio > 0.60:
+        hw, hh = fw // 2, fh // 2
+        subcrops = [
+            frame[0:hh,  0:hw],
+            frame[0:hh,  hw:fw],
+            frame[hh:fh, 0:hw],
+            frame[hh:fh, hw:fw],
+        ]
+        if debug:
+            print(f"  [{label}] BUS GRANDE ({bbox_ratio:.0%} frame) → probando sub-crops")
+        number = get_moondream_reader().read_subcrops(subcrops)
+        direction = "unknown"
+    elif label in ORIENTATION_TO_DIRECTION:
+        number, orientation = get_moondream_reader().read_with_orientation(bus_crop, cam_label=label)
+        orientation_map = ORIENTATION_TO_DIRECTION[label]
+        direction = orientation_map.get(orientation or "", "unknown")
+        if direction == "unknown":
+            direction = motion_filter.get_direction(best) or "unknown"
+        if debug and number is None:
+            dump_dir = Path(__file__).resolve().parent.parent / "captures" / "crop_debug"
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%H%M%S_%f")[:9]
+            cv2.imwrite(str(dump_dir / f"{ts}_{label.replace(' ','')}_normal.jpg"), bus_crop)
+    else:
+        number = get_moondream_reader().read(bus_crop, cam_label=label)
+        direction = "unknown"
+        if debug and number is None:
+            dump_dir = Path(__file__).resolve().parent.parent / "captures" / "crop_debug"
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%H%M%S_%f")[:9]
+            cv2.imwrite(str(dump_dir / f"{ts}_{label.replace(' ','')}_normal.jpg"), bus_crop)
+
+    if debug:
+        print(f"  [{label}] MOONDREAM: {number if number else 'none'} dir={direction}")
+    return (number, direction) if number else None
 
 
 # ── Report helper ────────────────────────────────────────────────────────────
@@ -781,16 +981,20 @@ def _report(number: int, direction: str, frame: np.ndarray, all_states: dict) ->
 
 # ── Tile rendering ────────────────────────────────────────────────────────────
 
+OVERLAY_MAX_AGE = 0.5  # segundos — si el overlay es más viejo que esto, mostrar frame en vivo
+
 def render_tile(state: CameraState, global_buffer: ConsensusBuffer) -> np.ndarray:
+    now = time.monotonic()
     with state.lock:
-        overlay         = state.overlay_frame.copy() if state.overlay_frame is not None else None
+        fresh           = state.overlay_frame is not None and (now - state.overlay_ts) < OVERLAY_MAX_AGE
+        overlay         = state.overlay_frame.copy() if fresh else None
         frame           = state.frame.copy() if state.frame is not None else None
         connected       = state.connected
         confirmed_label = state.confirmed_label
         cam_votes       = state.pending_count
         label           = state.label
 
-    # Cam 1: prefer the annotated overlay frame so the debug info is always visible
+    # Use overlay only while fresh — otherwise show live frame
     if overlay is not None:
         frame = overlay
 
@@ -839,10 +1043,14 @@ def main_loop(skip: int, confirm: int, min_window: float, max_window: float,
     for k, state in states.items():
         threading.Thread(target=reader_worker,
                          args=(state, skip, fps_cap), daemon=True).start()
-        # excluded cameras: start reader (to show video) but no processor
+        # excluded cameras: start reader (to show video) but no detection
         if k not in exclude:
-            threading.Thread(target=processor_worker,
-                             args=(state, global_buffer, states, detector, min_bbox, debug, ocr_backend),
+            motion_filter = MotionFilter()
+            threading.Thread(target=yolo_worker,
+                             args=(state, detector, motion_filter, min_bbox, debug),
+                             daemon=True).start()
+            threading.Thread(target=ocr_worker,
+                             args=(state, global_buffer, states, motion_filter, debug, ocr_backend),
                              daemon=True).start()
         else:
             print(f"[INFO] {state.label}: solo video, sin detección (excluida)")
@@ -860,11 +1068,10 @@ def main_loop(skip: int, confirm: int, min_window: float, max_window: float,
                     break
             _handle_event(event, f, states)
 
-        blank = np.zeros((TILE_H, TILE_W, 3), dtype=np.uint8)
         row0 = np.hstack([render_tile(states[1], global_buffer),
                           render_tile(states[2], global_buffer)])
         row1 = np.hstack([render_tile(states[3], global_buffer),
-                          blank])
+                          render_tile(states[4], global_buffer)])
         cv2.imshow("FonoBus - Multicam", np.vstack([row0, row1]))
 
         if cv2.waitKey(30) & 0xFF == ord("q"):

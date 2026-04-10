@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from config.settings import FLEET_MAX, FLEET_MIN, FLEET_YEAR_THRESHOLD
+from config.settings import FLEET_MAX, FLEET_MIN, FLEET_YEAR_THRESHOLD, FLEET_BLACKLIST
 
 _MODEL_ID = "vikhyatk/moondream2"
 _REVISION = "2024-08-26"
@@ -61,6 +61,8 @@ def _validate(value: int) -> bool:
     if not (FLEET_MIN <= value <= FLEET_MAX):
         return False
     if len(str(value)) == 4 and value >= FLEET_YEAR_THRESHOLD:
+        return False
+    if value in FLEET_BLACKLIST:
         return False
     return True
 
