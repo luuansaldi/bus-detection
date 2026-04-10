@@ -115,7 +115,7 @@ class MoondreamReader:
 
         print(f"[Moondream] Cargando modelo en {device} (primera vez: descarga ~1.8 GB)...")
 
-        dtype = torch.float16 if device == "cuda" else torch.float32
+        dtype = torch.float16 if device in ("mps", "cuda") else torch.float32
 
         self._tokenizer = AutoTokenizer.from_pretrained(
             _MODEL_ID, revision=_REVISION, trust_remote_code=True
