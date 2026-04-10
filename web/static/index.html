@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Fonobus — Monitor</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0d0f14;
+      color: #e0e6f0;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      min-height: 100vh;
+    }
+
+    /* ── Header ── */
+    header {
+      background: #13161e;
+      border-bottom: 1px solid #1e2330;
+      padding: 16px 32px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .logo { display: flex; align-items: center; gap: 12px; }
+    .logo-icon {
+      width: 36px; height: 36px;
+      background: #2563eb;
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px;
+    }
+    .logo h1 { font-size: 18px; font-weight: 600; letter-spacing: 0.02em; }
+    .logo span { font-size: 12px; color: #6b7280; margin-top: 1px; display: block; }
+
+    /* ── Camera indicators ── */
+    .cam-indicators {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .cam-pill {
+      display: flex; align-items: center; gap: 6px;
+      background: #1a1f2e;
+      border: 1px solid #1e2330;
+      border-radius: 20px;
+      padding: 5px 12px;
+      font-size: 12px;
+      color: #6b7280;
+      transition: border-color 0.3s, color 0.3s;
+    }
+    .cam-pill.online  { border-color: #166534; color: #4ade80; }
+    .cam-pill.offline { border-color: #7f1d1d; color: #f87171; }
+    .cam-dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: #374151;
+      transition: background 0.3s;
+    }
+    .cam-pill.online  .cam-dot { background: #22c55e; animation: pulse 2s infinite; }
+    .cam-pill.offline .cam-dot { background: #ef4444; }
+
+    /* ── WS status ── */
+    .ws-pill {
+      display: flex; align-items: center; gap: 8px;
+      background: #1a1f2e;
+      border: 1px solid #1e2330;
+      border-radius: 20px;
+      padding: 6px 14px;
+      font-size: 12px;
+      color: #6b7280;
+    }
+    .ws-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: #374151;
+    }
+    .ws-dot.connected    { background: #22c55e; animation: pulse 2s infinite; }
+    .ws-dot.reconnecting { background: #f59e0b; animation: pulse 0.8s infinite; }
+    .ws-dot.disconnected { background: #ef4444; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.35; }
+    }
+
+    /* ── Stats bar ── */
+    .stats {
+      display: flex;
+      gap: 16px;
+      padding: 20px 32px;
+    }
+    .stat-card {
+      flex: 1;
+      background: #13161e;
+      border: 1px solid #1e2330;
+      border-radius: 12px;
+      padding: 16px 20px;
+    }
+    .stat-label { font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.08em; }
+    .stat-value { font-size: 28px; font-weight: 700; margin-top: 6px; }
+    .stat-value.blue   { color: #60a5fa; }
+    .stat-value.green  { color: #4ade80; }
+    .stat-value.orange { color: #fb923c; }
+
+    /* ── Main content ── */
+    main { padding: 0 32px 32px; }
+
+    .section-header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 14px;
+    }
+    .section-title { font-size: 14px; font-weight: 600; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.08em; }
+    .section-sub   { font-size: 12px; color: #4b5563; }
+
+    /* ── Table ── */
+    .table-wrap {
+      background: #13161e;
+      border: 1px solid #1e2330;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    table { width: 100%; border-collapse: collapse; }
+    thead th {
+      background: #0d0f14;
+      padding: 12px 16px;
+      text-align: left;
+      font-size: 11px; font-weight: 600;
+      color: #4b5563;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      border-bottom: 1px solid #1e2330;
+    }
+    tbody tr { border-bottom: 1px solid #1a1f2c; transition: background 0.15s; }
+    tbody tr:last-child { border-bottom: none; }
+    tbody tr:hover { background: #181c28; }
+    tbody tr.new-row { animation: flashIn 1s ease; }
+    @keyframes flashIn {
+      0%   { background: #1e3a5f; }
+      100% { background: transparent; }
+    }
+    td { padding: 12px 16px; font-size: 14px; vertical-align: middle; }
+
+    .fleet-number {
+      font-size: 22px; font-weight: 700;
+      color: #f0f4ff;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 10px;
+      border-radius: 20px;
+      font-size: 12px; font-weight: 600;
+    }
+    .badge.entering { background: #052e16; color: #4ade80; border: 1px solid #166534; }
+    .badge.exiting  { background: #1c1917; color: #fb923c; border: 1px solid #78350f; }
+    .badge.unknown  { background: #1a1f2e; color: #6b7280; border: 1px solid #374151; }
+
+    .ts { color: #6b7280; font-size: 13px; font-variant-numeric: tabular-nums; }
+
+    .thumb-wrap {
+      width: 80px; height: 50px;
+      border-radius: 6px; overflow: hidden;
+      background: #0d0f14;
+      border: 1px solid #1e2330;
+    }
+    .thumb-wrap img {
+      width: 100%; height: 100%; object-fit: cover;
+      cursor: pointer; transition: opacity 0.2s;
+    }
+    .thumb-wrap img:hover { opacity: 0.8; }
+    .no-img { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; color: #374151; font-size: 18px; }
+
+    .empty-state { padding: 60px; text-align: center; color: #374151; }
+    .empty-state .icon { font-size: 40px; margin-bottom: 12px; }
+    .empty-state p { font-size: 14px; }
+
+    /* ── Lightbox ── */
+    #lightbox {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,0.85);
+      z-index: 100; align-items: center; justify-content: center;
+    }
+    #lightbox.open { display: flex; }
+    #lightbox img { max-width: 90vw; max-height: 85vh; border-radius: 10px; box-shadow: 0 0 60px rgba(0,0,0,0.8); }
+    #lightbox-close { position: absolute; top: 20px; right: 28px; color: #fff; font-size: 28px; cursor: pointer; }
+
+    /* ── Tabs ── */
+    .tabs {
+      display: flex; gap: 4px;
+      padding: 16px 32px 0;
+    }
+    .tab {
+      padding: 8px 20px;
+      border-radius: 8px 8px 0 0;
+      font-size: 13px; font-weight: 600;
+      cursor: pointer; color: #6b7280;
+      background: transparent;
+      border: 1px solid transparent;
+      border-bottom: none;
+      transition: color 0.15s, background 0.15s;
+    }
+    .tab.active {
+      background: #13161e;
+      border-color: #1e2330;
+      color: #e0e6f0;
+    }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+
+    /* ── Stats page ── */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      padding: 20px 32px 32px;
+    }
+    .chart-card {
+      background: #13161e;
+      border: 1px solid #1e2330;
+      border-radius: 12px;
+      padding: 20px;
+    }
+    .chart-card.full { grid-column: 1 / -1; }
+    .chart-title { font-size: 13px; font-weight: 600; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 16px; }
+
+    /* Bar chart */
+    .bar-chart { display: flex; align-items: flex-end; gap: 4px; height: 120px; }
+    .bar-wrap  { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px; height: 100%; justify-content: flex-end; }
+    .bar       { width: 100%; border-radius: 3px 3px 0 0; min-height: 2px; transition: height 0.4s ease; }
+    .bar.entering { background: #166534; }
+    .bar.exiting  { background: #78350f; }
+    .bar.total    { background: #1d4ed8; }
+    .bar-label { font-size: 9px; color: #4b5563; }
+    .bar-val   { font-size: 9px; color: #6b7280; }
+
+    /* Frequent buses table */
+    .freq-table { width: 100%; border-collapse: collapse; }
+    .freq-table td { padding: 8px 4px; font-size: 13px; border-bottom: 1px solid #1a1f2c; }
+    .freq-table tr:last-child td { border-bottom: none; }
+    .freq-num { font-size: 18px; font-weight: 700; color: #f0f4ff; }
+    .freq-bar-wrap { width: 100%; background: #0d0f14; border-radius: 4px; height: 6px; overflow: hidden; }
+    .freq-bar-fill { height: 100%; border-radius: 4px; background: #2563eb; }
+
+    /* Day table */
+    .day-table { width: 100%; border-collapse: collapse; }
+    .day-table th { font-size: 11px; color: #4b5563; text-align: left; padding: 6px 4px; border-bottom: 1px solid #1e2330; }
+    .day-table td { padding: 8px 4px; font-size: 13px; border-bottom: 1px solid #1a1f2c; color: #9ca3af; }
+    .day-table tr:last-child td { border-bottom: none; }
+    .day-table .num { font-weight: 600; color: #e0e6f0; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">🚌</div>
+    <div>
+      <h1>Fonobus Monitor</h1>
+      <span>Sistema de detección de flota</span>
+    </div>
+  </div>
+
+  <div class="cam-indicators">
+    <div class="cam-pill" id="cam-Cam 1"><div class="cam-dot"></div>Cam 1</div>
+    <div class="cam-pill" id="cam-Cam 2"><div class="cam-dot"></div>Cam 2</div>
+    <div class="cam-pill" id="cam-Cam 3"><div class="cam-dot"></div>Cam 3</div>
+    <div class="cam-pill" id="cam-Cam 4"><div class="cam-dot"></div>Cam 4</div>
+  </div>
+
+  <div class="ws-pill">
+    <div class="ws-dot" id="ws-dot"></div>
+    <span id="ws-text">Conectando...</span>
+  </div>
+</header>
+
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('detecciones')">Detecciones</div>
+  <div class="tab"        onclick="switchTab('estadisticas')">Estadísticas</div>
+</div>
+
+<div class="stats">
+  <div class="stat-card">
+    <div class="stat-label">Total detectados</div>
+    <div class="stat-value blue"   id="stat-total">—</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Entraron</div>
+    <div class="stat-value green"  id="stat-entering">—</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Salieron</div>
+    <div class="stat-value orange" id="stat-exiting">—</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Última detección</div>
+    <div class="stat-value blue" id="stat-last" style="font-size:16px;margin-top:10px;">—</div>
+  </div>
+</div>
+
+<div id="tab-detecciones" class="tab-content active">
+<main>
+  <div class="section-header">
+    <div class="section-title">Detecciones recientes</div>
+    <div class="section-sub" id="section-sub">Tiempo real vía WebSocket</div>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Flota</th>
+          <th>Dirección</th>
+          <th>Timestamp</th>
+          <th>Captura</th>
+        </tr>
+      </thead>
+      <tbody id="tbody">
+        <tr><td colspan="4"><div class="empty-state"><div class="icon">🔍</div><p>Esperando detecciones...</p></div></td></tr>
+      </tbody>
+    </table>
+  </div>
+</main>
+</div>
+
+<!-- ── Tab Estadísticas ── -->
+<div id="tab-estadisticas" class="tab-content">
+  <div class="stats-grid">
+
+    <div class="chart-card full">
+      <div class="chart-title">Actividad por hora del día</div>
+      <div class="bar-chart" id="chart-hora"></div>
+      <div style="display:flex;gap:16px;margin-top:10px;">
+        <span style="font-size:11px;color:#4ade80">■ Entraron</span>
+        <span style="font-size:11px;color:#fb923c">■ Salieron</span>
+      </div>
+    </div>
+
+    <div class="chart-card">
+      <div class="chart-title">Buses más frecuentes</div>
+      <table class="freq-table" id="freq-table">
+        <tr><td style="color:#374151;text-align:center;padding:20px">Sin datos aún</td></tr>
+      </table>
+    </div>
+
+    <div class="chart-card">
+      <div class="chart-title">Resumen por día</div>
+      <table class="day-table" id="day-table">
+        <thead><tr><th>Fecha</th><th>Total</th><th>Entraron</th><th>Salieron</th></tr></thead>
+        <tbody><tr><td colspan="4" style="color:#374151;text-align:center;padding:20px">Sin datos aún</td></tr></tbody>
+      </table>
+    </div>
+
+  </div>
+</div>
+
+<div id="lightbox">
+  <span id="lightbox-close">✕</span>
+  <img id="lightbox-img" src="" alt="Captura" />
+</div>
+
+<script>
+  // ── State ──────────────────────────────────────────────────────────────────
+  let totalEntering = 0;
+  let totalExiting  = 0;
+  let totalAll      = 0;
+  let initialLoaded = false;
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+  function dirBadge(dir) {
+    if (dir === 'entering') return '<span class="badge entering">↙ Entró</span>';
+    if (dir === 'exiting')  return '<span class="badge exiting">↗ Salió</span>';
+    return '<span class="badge unknown">— Desconocido</span>';
+  }
+
+  function thumb(imagePath) {
+    if (!imagePath) return '<div class="thumb-wrap"><div class="no-img">📷</div></div>';
+    const filename = (imagePath.split('/').pop() || '').split('\\').pop();
+    const url = `/captures/${filename}`;
+    return `<div class="thumb-wrap"><img src="${url}" loading="lazy" onclick="openLightbox('${url}')" /></div>`;
+  }
+
+  function rowHtml(r, animate) {
+    return `<tr${animate ? ' class="new-row"' : ''}>
+      <td><span class="fleet-number">${r.numero_flota}</span></td>
+      <td>${dirBadge(r.direccion)}</td>
+      <td><span class="ts">${r.timestamp}</span></td>
+      <td>${thumb(r.imagen_path)}</td>
+    </tr>`;
+  }
+
+  function updateStats(rows) {
+    totalAll      = rows.length;
+    totalEntering = rows.filter(r => r.direccion === 'entering').length;
+    totalExiting  = rows.filter(r => r.direccion === 'exiting').length;
+    document.getElementById('stat-total').textContent    = totalAll;
+    document.getElementById('stat-entering').textContent = totalEntering;
+    document.getElementById('stat-exiting').textContent  = totalExiting;
+    if (rows.length) document.getElementById('stat-last').textContent = rows[0].timestamp.slice(11,19);
+  }
+
+  function incrementStats(dir) {
+    totalAll++;
+    if (dir === 'entering') totalEntering++;
+    if (dir === 'exiting')  totalExiting++;
+    document.getElementById('stat-total').textContent    = totalAll;
+    document.getElementById('stat-entering').textContent = totalEntering;
+    document.getElementById('stat-exiting').textContent  = totalExiting;
+    document.getElementById('stat-last').textContent     = new Date().toTimeString().slice(0,8);
+  }
+
+  function addRow(r, animate) {
+    const tbody = document.getElementById('tbody');
+    // Quitar empty state si existe
+    if (tbody.querySelector('.empty-state')) tbody.innerHTML = '';
+    tbody.insertAdjacentHTML('afterbegin', rowHtml(r, animate));
+  }
+
+  // ── Camera status ──────────────────────────────────────────────────────────
+  function setCamStatus(cam, connected) {
+    const el = document.getElementById('cam-' + cam);
+    if (!el) return;
+    el.classList.toggle('online',  connected);
+    el.classList.toggle('offline', !connected);
+  }
+
+  // ── WS status indicator ───────────────────────────────────────────────────
+  function setWsStatus(state) {
+    const dot  = document.getElementById('ws-dot');
+    const text = document.getElementById('ws-text');
+    dot.className = 'ws-dot ' + state;
+    if (state === 'connected')    text.textContent = 'Tiempo real';
+    if (state === 'reconnecting') text.textContent = 'Reconectando...';
+    if (state === 'disconnected') text.textContent = 'Sin conexión';
+  }
+
+  // ── Load initial data via REST ─────────────────────────────────────────────
+  async function loadInitial() {
+    try {
+      const res  = await fetch('/api/detecciones?limit=50');
+      const rows = await res.json();
+      if (rows.length === 0) return;
+      const tbody = document.getElementById('tbody');
+      tbody.innerHTML = rows.map(r => rowHtml(r, false)).join('');
+      updateStats(rows);
+      initialLoaded = true;
+    } catch(e) {
+      console.warn('No se pudo cargar historial inicial', e);
+    }
+  }
+
+  // ── WebSocket ──────────────────────────────────────────────────────────────
+  let ws;
+  let reconnectTimer;
+
+  function connectWS() {
+    clearTimeout(reconnectTimer);
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+    ws.onopen = () => {
+      setWsStatus('connected');
+      document.getElementById('section-sub').textContent = 'Tiempo real vía WebSocket';
+    };
+
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+
+      if (msg.type === 'detection') {
+        addRow(msg, true);
+        incrementStats(msg.direccion);
+      }
+
+      if (msg.type === 'camera_status') {
+        setCamStatus(msg.cam, msg.connected);
+      }
+    };
+
+    ws.onclose = () => {
+      setWsStatus('reconnecting');
+      document.getElementById('section-sub').textContent = 'Reconectando...';
+      reconnectTimer = setTimeout(connectWS, 3000);
+    };
+
+    ws.onerror = () => {
+      setWsStatus('disconnected');
+      ws.close();
+    };
+  }
+
+  // ── Lightbox ───────────────────────────────────────────────────────────────
+  function openLightbox(url) {
+    document.getElementById('lightbox-img').src = url;
+    document.getElementById('lightbox').classList.add('open');
+  }
+  document.getElementById('lightbox-close').onclick = () =>
+    document.getElementById('lightbox').classList.remove('open');
+  document.getElementById('lightbox').onclick = (e) => {
+    if (e.target === document.getElementById('lightbox'))
+      document.getElementById('lightbox').classList.remove('open');
+  };
+
+  // ── Tabs ───────────────────────────────────────────────────────────────────
+  function switchTab(name) {
+    document.querySelectorAll('.tab').forEach((t, i) => {
+      const names = ['detecciones', 'estadisticas'];
+      t.classList.toggle('active', names[i] === name);
+    });
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+    document.getElementById('tab-' + name).classList.add('active');
+    if (name === 'estadisticas') loadStats();
+  }
+
+  // ── Stats ──────────────────────────────────────────────────────────────────
+  async function loadStats() {
+    const [horaRes, diaRes, freqRes] = await Promise.all([
+      fetch('/api/stats/por-hora').then(r => r.json()),
+      fetch('/api/stats/por-dia').then(r => r.json()),
+      fetch('/api/stats/frecuentes').then(r => r.json()),
+    ]);
+    renderHora(horaRes);
+    renderDia(diaRes);
+    renderFreq(freqRes);
+  }
+
+  function renderHora(data) {
+    const el = document.getElementById('chart-hora');
+    if (!data.length) { el.innerHTML = '<span style="color:#374151;font-size:13px">Sin datos aún</span>'; return; }
+    const byHour = {};
+    data.forEach(r => byHour[r.hora] = r);
+    const maxVal = Math.max(...data.map(r => r.total), 1);
+    let html = '';
+    for (let h = 0; h < 24; h++) {
+      const r = byHour[h] || { total: 0, entraron: 0, salieron: 0 };
+      const hE = Math.round((r.entraron / maxVal) * 100);
+      const hS = Math.round((r.salieron / maxVal) * 100);
+      html += `<div class="bar-wrap">
+        <div style="display:flex;flex-direction:column;justify-content:flex-end;height:100%;gap:1px;width:100%">
+          <div class="bar entering" style="height:${hE}%"></div>
+          <div class="bar exiting"  style="height:${hS}%"></div>
+        </div>
+        <div class="bar-label">${String(h).padStart(2,'0')}</div>
+      </div>`;
+    }
+    el.innerHTML = html;
+  }
+
+  function renderFreq(data) {
+    const el = document.getElementById('freq-table');
+    if (!data.length) return;
+    const max = data[0].total;
+    el.innerHTML = data.map((r, i) => `
+      <tr>
+        <td style="color:#6b7280;font-size:12px;width:20px">#${i+1}</td>
+        <td><span class="freq-num">${r.numero_flota}</span></td>
+        <td style="width:40%">
+          <div class="freq-bar-wrap">
+            <div class="freq-bar-fill" style="width:${Math.round(r.total/max*100)}%"></div>
+          </div>
+        </td>
+        <td style="text-align:right;color:#60a5fa;font-weight:600">${r.total}x</td>
+        <td style="color:#4b5563;font-size:11px;padding-left:8px">${r.ultima_vez.slice(0,10)}</td>
+      </tr>`).join('');
+  }
+
+  function renderDia(data) {
+    const tbody = document.querySelector('#day-table tbody');
+    if (!data.length) return;
+    tbody.innerHTML = data.map(r => `
+      <tr>
+        <td class="num">${r.dia}</td>
+        <td class="num" style="color:#60a5fa">${r.total}</td>
+        <td style="color:#4ade80">${r.entraron}</td>
+        <td style="color:#fb923c">${r.salieron}</td>
+      </tr>`).join('');
+  }
+
+  // ── Init ───────────────────────────────────────────────────────────────────
+  loadInitial();
+  connectWS();
+</script>
+</body>
+</html>
