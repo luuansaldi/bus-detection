@@ -251,6 +251,47 @@
     .day-table td { padding: 8px 4px; font-size: 13px; border-bottom: 1px solid #1a1f2c; color: #9ca3af; }
     .day-table tr:last-child td { border-bottom: none; }
     .day-table .num { font-weight: 600; color: #e0e6f0; }
+
+    /* ── Por Bus tab ── */
+    .bus-row-main { cursor: pointer; }
+    .bus-row-main:hover { background: #181c28; }
+    .expand-arrow { display: inline-block; transition: transform 0.2s; color: #4b5563; font-size: 11px; }
+    .expand-arrow.open { transform: rotate(90deg); }
+
+    .bus-row-captures { display: none; }
+    .bus-row-captures.open { display: table-row; }
+    .bus-row-captures > td { padding: 0; background: #0a0c11; border-top: 1px solid #1e2330; }
+
+    .captures-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      padding: 16px 20px;
+    }
+    .capture-card {
+      background: #13161e;
+      border: 1px solid #1e2330;
+      border-radius: 8px;
+      overflow: hidden;
+      width: 130px;
+      flex-shrink: 0;
+    }
+    .capture-card img {
+      width: 100%; height: 80px;
+      object-fit: cover;
+      cursor: pointer;
+      display: block;
+      transition: opacity 0.2s;
+    }
+    .capture-card img:hover { opacity: 0.8; }
+    .no-img-card {
+      width: 100%; height: 80px;
+      display: flex; align-items: center; justify-content: center;
+      background: #0d0f14; color: #374151; font-size: 22px;
+    }
+    .capture-card .card-info { padding: 7px 8px; }
+    .capture-card .card-time { font-size: 11px; color: #6b7280; font-variant-numeric: tabular-nums; margin-bottom: 4px; }
+    .capture-card .badge { font-size: 10px; padding: 2px 7px; }
   </style>
 </head>
 <body>
@@ -280,6 +321,7 @@
 <div class="tabs">
   <div class="tab active" onclick="switchTab('detecciones')">Detecciones</div>
   <div class="tab"        onclick="switchTab('estadisticas')">Estadísticas</div>
+  <div class="tab"        onclick="switchTab('porbus')">Por Bus</div>
 </div>
 
 <div class="stats">
@@ -353,6 +395,32 @@
       </table>
     </div>
 
+  </div>
+</div>
+
+<!-- ── Tab Por Bus ── -->
+<div id="tab-porbus" class="tab-content">
+  <div style="padding: 20px 32px 32px">
+    <div class="section-header">
+      <div class="section-title">Registro por bus</div>
+      <div class="section-sub">Clic en una fila para ver capturas</div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th style="width:32px"></th>
+            <th>Flota</th>
+            <th>Entradas</th>
+            <th>Salidas</th>
+            <th>Total</th>
+          </tr>
+        </thead>
+        <tbody id="bus-tbody">
+          <tr><td colspan="5"><div class="empty-state"><div class="icon">🚌</div><p>Sin detecciones aún</p></div></td></tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 </div>
 
@@ -471,6 +539,7 @@
       if (msg.type === 'detection') {
         addRow(msg, true);
         incrementStats(msg.direccion);
+        updateBusRegistry(msg);
       }
 
       if (msg.type === 'camera_status') {
@@ -504,13 +573,14 @@
 
   // ── Tabs ───────────────────────────────────────────────────────────────────
   function switchTab(name) {
+    const names = ['detecciones', 'estadisticas', 'porbus'];
     document.querySelectorAll('.tab').forEach((t, i) => {
-      const names = ['detecciones', 'estadisticas'];
       t.classList.toggle('active', names[i] === name);
     });
     document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
     document.getElementById('tab-' + name).classList.add('active');
     if (name === 'estadisticas') loadStats();
+    if (name === 'porbus') loadPorBus();
   }
 
   // ── Stats ──────────────────────────────────────────────────────────────────
@@ -575,6 +645,105 @@
         <td style="color:#4ade80">${r.entraron}</td>
         <td style="color:#fb923c">${r.salieron}</td>
       </tr>`).join('');
+  }
+
+  // ── Por Bus ────────────────────────────────────────────────────────────────
+  let busRegistry = {};
+
+  async function loadPorBus() {
+    try {
+      const data = await fetch('/api/stats/por-numero').then(r => r.json());
+      busRegistry = {};
+      data.forEach(b => { busRegistry[b.numero_flota] = b; });
+      renderPorBus();
+    } catch(e) {
+      console.warn('No se pudo cargar registro por bus', e);
+    }
+  }
+
+  function renderPorBus() {
+    const tbody = document.getElementById('bus-tbody');
+    const buses = Object.values(busRegistry).sort((a, b) => b.total - a.total);
+    if (!buses.length) {
+      tbody.innerHTML = '<tr><td colspan="5"><div class="empty-state"><div class="icon">🚌</div><p>Sin detecciones aún</p></div></td></tr>';
+      return;
+    }
+    tbody.innerHTML = buses.map(b => busRowHtml(b)).join('');
+  }
+
+  function busRowHtml(b) {
+    const id = 'bus-' + b.numero_flota;
+    return `<tr class="bus-row-main" onclick="toggleBus(${b.numero_flota})" id="main-${id}">
+        <td><span class="expand-arrow" id="arrow-${id}">▶</span></td>
+        <td><span class="fleet-number">${b.numero_flota}</span></td>
+        <td><span class="badge entering">↙ ${b.entradas}</span></td>
+        <td><span class="badge exiting">↗ ${b.salidas}</span></td>
+        <td style="color:#60a5fa;font-weight:600">${b.total}</td>
+      </tr>
+      <tr class="bus-row-captures" id="captures-${id}">
+        <td colspan="5">
+          <div class="captures-grid" id="grid-${id}">
+            ${b.capturas.map(c => captureCardHtml(c)).join('')}
+          </div>
+        </td>
+      </tr>`;
+  }
+
+  function captureCardHtml(c) {
+    let imgHtml;
+    if (c.imagen_path) {
+      const filename = (c.imagen_path.split('/').pop() || '').split('\\').pop();
+      const url = '/captures/' + filename;
+      imgHtml = `<img src="${url}" loading="lazy" onclick="openLightbox('${url}')" />`;
+    } else {
+      imgHtml = '<div class="no-img-card">📷</div>';
+    }
+    return `<div class="capture-card">
+      ${imgHtml}
+      <div class="card-info">
+        <div class="card-time">${c.timestamp.slice(11,19)}</div>
+        ${dirBadge(c.direccion)}
+      </div>
+    </div>`;
+  }
+
+  function toggleBus(numero_flota) {
+    const id = 'bus-' + numero_flota;
+    const capturesRow = document.getElementById('captures-' + id);
+    const arrow       = document.getElementById('arrow-' + id);
+    const isOpen = capturesRow.classList.contains('open');
+    capturesRow.classList.toggle('open', !isOpen);
+    arrow.classList.toggle('open', !isOpen);
+  }
+
+  function updateBusRegistry(msg) {
+    const n = msg.numero_flota;
+    if (!busRegistry[n]) {
+      busRegistry[n] = { numero_flota: n, total: 0, entradas: 0, salidas: 0, capturas: [] };
+    }
+    const b = busRegistry[n];
+    b.total++;
+    if (msg.direccion === 'entering') b.entradas++;
+    if (msg.direccion === 'exiting')  b.salidas++;
+    b.capturas.push({ timestamp: msg.timestamp, direccion: msg.direccion, imagen_path: msg.imagen_path || null });
+
+    const activeTab = document.querySelector('.tab-content.active');
+    if (!activeTab || activeTab.id !== 'tab-porbus') return;
+
+    const id = 'bus-' + n;
+    const mainRow = document.getElementById('main-' + id);
+    if (!mainRow) {
+      renderPorBus();
+      return;
+    }
+    const cells = mainRow.querySelectorAll('td');
+    cells[2].innerHTML = '<span class="badge entering">↙ ' + b.entradas + '</span>';
+    cells[3].innerHTML = '<span class="badge exiting">↗ '  + b.salidas  + '</span>';
+    cells[4].textContent = b.total;
+    const grid = document.getElementById('grid-' + id);
+    if (grid) {
+      grid.insertAdjacentHTML('beforeend', captureCardHtml(b.capturas[b.capturas.length - 1]));
+    }
   }
 
   // ── Init ───────────────────────────────────────────────────────────────────

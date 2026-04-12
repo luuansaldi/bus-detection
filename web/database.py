@@ -93,6 +93,37 @@ def stats_frecuentes(limit: int = 10) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def stats_por_numero() -> list[dict]:
+    """Detecciones agrupadas por número de flota, con todas sus capturas."""
+    with get_conn() as conn:
+        buses = conn.execute("""
+            SELECT numero_flota,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN direccion='entering' THEN 1 ELSE 0 END) AS entradas,
+                   SUM(CASE WHEN direccion='exiting'  THEN 1 ELSE 0 END) AS salidas
+            FROM detecciones
+            GROUP BY numero_flota
+            ORDER BY total DESC
+        """).fetchall()
+
+        result = []
+        for bus in buses:
+            capturas = conn.execute("""
+                SELECT id, timestamp, direccion, imagen_path
+                FROM detecciones
+                WHERE numero_flota = ?
+                ORDER BY timestamp ASC
+            """, (bus["numero_flota"],)).fetchall()
+            result.append({
+                "numero_flota": bus["numero_flota"],
+                "total":        bus["total"],
+                "entradas":     bus["entradas"],
+                "salidas":      bus["salidas"],
+                "capturas":     [dict(c) for c in capturas],
+            })
+    return result
+
+
 def obtener(limit: int = 100, offset: int = 0) -> list[dict]:
     """Devuelve las últimas detecciones, más recientes primero."""
     with get_conn() as conn:

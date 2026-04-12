@@ -21,7 +21,7 @@ from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from web.database import init_db, obtener, stats_por_hora, stats_por_dia, stats_frecuentes
+from web.database import init_db, obtener, stats_por_hora, stats_por_dia, stats_frecuentes, stats_por_numero
 
 CAPTURES_DIR = Path(__file__).resolve().parent.parent / "captures"
 STATIC_DIR   = Path(__file__).resolve().parent / "static"
@@ -130,6 +130,10 @@ def get_stats_dia():
 @app.get("/api/stats/frecuentes")
 def get_stats_frecuentes():
     return JSONResponse(content=stats_frecuentes())
+
+@app.get("/api/stats/por-numero")
+def get_stats_por_numero():
+    return JSONResponse(content=stats_por_numero())
 
 
 @app.get("/captures/{filename}")
