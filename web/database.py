@@ -9,7 +9,7 @@ Cada vez que el sistema detecta un bus con consenso, se guarda una fila con:
 """
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 DB_PATH = Path(__file__).resolve().parent.parent / "detecciones.db"
@@ -122,6 +122,48 @@ def stats_por_numero() -> list[dict]:
                 "capturas":     [dict(c) for c in capturas],
             })
     return result
+
+
+def limpiar_capturas_antiguas(retention_days: int) -> int:
+    """
+    Elimina solo los archivos de imagen de captures/ más viejos que retention_days.
+    Los registros en DB se mantienen (imagen_path queda en NULL).
+    Retorna la cantidad de archivos borrados.
+    """
+    from pathlib import Path as _Path
+
+    cutoff = datetime.now() - timedelta(days=retention_days)
+    cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+
+    captures_dir = DB_PATH.parent / "captures"
+    archivos_borrados = 0
+
+    with get_conn() as conn:
+        filas = conn.execute(
+            "SELECT id, imagen_path FROM detecciones WHERE timestamp < ? AND imagen_path IS NOT NULL",
+            (cutoff_str,),
+        ).fetchall()
+
+        ids_limpiados = []
+        for fila in filas:
+            img = _Path(fila["imagen_path"])
+            if not img.is_absolute():
+                img = captures_dir / img.name
+            if img.exists():
+                try:
+                    img.unlink()
+                    archivos_borrados += 1
+                except OSError:
+                    pass
+            ids_limpiados.append(fila["id"])
+
+        if ids_limpiados:
+            conn.execute(
+                f"UPDATE detecciones SET imagen_path = NULL WHERE id IN ({','.join('?' * len(ids_limpiados))})",
+                ids_limpiados,
+            )
+
+    return archivos_borrados
 
 
 def obtener(limit: int = 100, offset: int = 0) -> list[dict]:

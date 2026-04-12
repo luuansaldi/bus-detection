@@ -21,7 +21,8 @@ from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from web.database import init_db, obtener, stats_por_hora, stats_por_dia, stats_frecuentes, stats_por_numero
+from web.database import init_db, obtener, stats_por_hora, stats_por_dia, stats_frecuentes, stats_por_numero, limpiar_capturas_antiguas
+from config.settings import CAPTURES_RETENTION_DAYS
 
 CAPTURES_DIR = Path(__file__).resolve().parent.parent / "captures"
 STATIC_DIR   = Path(__file__).resolve().parent / "static"
@@ -82,6 +83,19 @@ async def _broadcast_worker():
         await _manager.broadcast(data)
 
 
+async def _cleanup_worker():
+    """Borra imágenes antiguas cada 7 días. Los registros DB se mantienen."""
+    while True:
+        await asyncio.sleep(7 * 24 * 60 * 60)
+        archivos = await asyncio.get_event_loop().run_in_executor(
+            None, limpiar_capturas_antiguas, CAPTURES_RETENTION_DAYS
+        )
+        if archivos:
+            print(f"[Cleanup] {archivos} imagen(es) eliminada(s) (>{CAPTURES_RETENTION_DAYS} días).")
+        else:
+            print(f"[Cleanup] Sin imágenes antiguas (retención: {CAPTURES_RETENTION_DAYS} días).")
+
+
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
@@ -91,6 +105,7 @@ async def startup():
     _event_queue = asyncio.Queue()
     _loop = asyncio.get_event_loop()
     asyncio.create_task(_broadcast_worker())
+    asyncio.create_task(_cleanup_worker())
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────

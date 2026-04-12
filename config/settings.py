@@ -24,6 +24,12 @@ FLEET_BLACKLIST = {10, 90}
 # 4-digit numbers >= this value are assumed to be years — not applicable with max=1500
 FLEET_YEAR_THRESHOLD = 2000
 
+# ── Captures cleanup ─────────────────────────────────────────────────────────
+
+# Capturas más viejas que este número de días se eliminan automáticamente.
+# El cleanup corre al iniciar el servidor y cada 24 horas.
+CAPTURES_RETENTION_DAYS = 7
+
 # ── Claude Vision OCR settings ────────────────────────────────────────────────
 
 # Model used for fleet number reading via vision API
