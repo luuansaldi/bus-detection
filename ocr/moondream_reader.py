@@ -115,7 +115,13 @@ class MoondreamReader:
 
         print(f"[Moondream] Cargando modelo en {device} (primera vez: descarga ~1.8 GB)...")
 
-        dtype = torch.float16 if device in ("mps", "cuda") else torch.float32
+        # ⚠️  NO cambiar esto a float16 para MPS aunque parezca una optimización.
+        # MPS (Apple Silicon) no soporta int64 en algunas operaciones internas del modelo
+        # (embeddings posicionales, índices de atención), lo que causa:
+        #   "out of range integral type conversion attempted"
+        # y el modelo falla silenciosamente en cada inferencia.
+        # CUDA sí soporta float16 sin problema — por eso solo se activa ahí.
+        dtype = torch.float16 if device == "cuda" else torch.float32
 
         self._tokenizer = AutoTokenizer.from_pretrained(
             _MODEL_ID, revision=_REVISION, trust_remote_code=True
