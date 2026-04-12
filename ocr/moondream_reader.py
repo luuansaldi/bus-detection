@@ -115,7 +115,7 @@ class MoondreamReader:
 
         print(f"[Moondream] Cargando modelo en {device} (primera vez: descarga ~1.8 GB)...")
 
-        dtype = torch.float16 if device == "cuda" else torch.float32
+        dtype = torch.float16 if device in ("mps", "cuda") else torch.float32
 
         self._tokenizer = AutoTokenizer.from_pretrained(
             _MODEL_ID, revision=_REVISION, trust_remote_code=True
@@ -157,6 +157,10 @@ class MoondreamReader:
                 enc = self._model.encode_image(pil_img)
                 answer = self._model.answer_question(enc, _QUERY, self._tokenizer)
 
+            import torch
+            if self._device == "cuda":
+                torch.cuda.empty_cache()
+
             return _parse(answer)
 
         except Exception as e:
@@ -185,6 +189,10 @@ class MoondreamReader:
         except Exception as e:
             print(f"[Moondream] ERROR subcrop: {e}")
             return None
+        finally:
+            if self._device == "cuda":
+                import torch
+                torch.cuda.empty_cache()
 
     def read_with_orientation(
         self, crop_bgr: np.ndarray, cam_label: str = ""
@@ -223,10 +231,17 @@ class MoondreamReader:
             else:
                 orientation = None
 
+            if self._device == "cuda":
+                import torch
+                torch.cuda.empty_cache()
+
             return number, orientation
 
         except Exception as e:
             print(f"[Moondream] ERROR: {e}")
+            if self._device == "cuda":
+                import torch
+                torch.cuda.empty_cache()
             return None, None
 
 
