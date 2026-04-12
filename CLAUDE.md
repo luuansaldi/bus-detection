@@ -28,6 +28,9 @@ python scripts/rtsp_multicam.py --debug
 
 # Live RTSP single camera with keyboard switching (1/2/3/4) — legacy EasyOCR only
 python scripts/rtsp_stream.py
+
+# Web dashboard (open http://localhost:8000 in browser)
+.venv/bin/python -m uvicorn web.app:app --port 8000
 ```
 
 ## Architecture
@@ -117,13 +120,46 @@ Confirmed detections are saved to `captures/` as `YYYYMMDD_HHMMSS_<number>_<dire
 
 ---
 
-## Estado actual del proyecto (2026-04-10)
+## Web dashboard (`web/`)
+
+FastAPI server + SQLite + WebSocket + dashboard HTML/JS (sin frameworks).
+
+```
+web/
+├── app.py          FastAPI: rutas REST + WebSocket broadcaster
+├── database.py     SQLite CRUD + funciones de agregación
+└── static/
+    └── index.html  Dashboard completo (HTML + CSS + JS inline)
+```
+
+**API endpoints:**
+
+| Endpoint | Descripción |
+|----------|-------------|
+| `GET /api/detecciones` | Últimas detecciones (paginado: `limit`, `offset`) |
+| `GET /api/stats/por-hora` | Actividad agrupada por hora (0–23) |
+| `GET /api/stats/por-dia` | Últimos 30 días con desglose entering/exiting |
+| `GET /api/stats/frecuentes` | Top 10 buses más detectados |
+| `GET /api/stats/por-numero` | Registro por número de flota con todas sus capturas |
+| `GET /captures/<filename>` | Sirve imágenes de `captures/` |
+| `WS  /ws` | Stream en tiempo real: eventos `detection` y `camera_status` |
+
+**Tabs del dashboard:**
+- **Detecciones** — feed en tiempo real vía WebSocket
+- **Estadísticas** — gráfico por hora, frecuentes, resumen por día
+- **Por Bus** — una fila por número de flota (entradas + salidas); expandible para ver todas las capturas con hora y dirección
+
+**Integración con detección:** `emit_event(data)` en `web/app.py` es thread-safe. Llamarlo desde cualquier thread de detección para hacer broadcast a todos los clientes conectados.
+
+---
+
+## Estado actual del proyecto (2026-04-12)
 
 ### Ramas
 | Rama | Responsable | Propósito |
 |------|-------------|-----------|
 | `main` | — | Base estable |
-| `interfaz-web` | Lucia | Interfaz web para integrar el sistema |
+| `feature/dashboard-registro-por-bus` | Lucia | Tab "Por Bus" en dashboard: registro agrupado por flota con capturas |
 | `cambios-direcciones-deteccion` | Compañero | Mejoras en detección y dirección |
 
 ### Infraestructura
@@ -136,13 +172,16 @@ Confirmed detections are saved to `captures/` as `YYYYMMDD_HHMMSS_<number>_<dire
 - 4 cámaras en paralelo con threads separados (reader / yolo_worker / ocr_worker)
 - Detección de dirección por zona en Cam 1 (barrera): zona A (exterior) → zona B (depósito) = entrando; inverso = saliendo
 - Blacklist de número 90 (carteles de límite de velocidad pintados en buses)
+- Dashboard web con feed en tiempo real, estadísticas y registro por bus con capturas
 
 ### Pendiente / en progreso
 - Validar dirección en vivo con buses reales cruzando Cam 1
-- Interfaz web (`interfaz-web`): por iniciar
-- Mejoras de detección (`cambios-direcciones-deteccion`): en progreso por compañero
+- Comparación de capturas entrada/salida con IA para detectar daños (futuro)
 
 ### Cómo correr
 ```bash
+# Detección + dashboard juntos
 cd fonobus && .venv/bin/python scripts/rtsp_multicam.py --debug
+# En otra terminal:
+.venv/bin/python -m uvicorn web.app:app --port 8000
 ```
