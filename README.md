@@ -71,9 +71,9 @@ El backend legacy EasyOCR (`--ocr-backend easyocr`) extrae sub-zonas del bus, ge
 
 ## Detección de dirección
 
-Las 4 cámaras ven el depósito desde ángulos distintos. Solo **Cam 3** puede distinguir entrada de salida de forma confiable (los buses se mueven en direcciones opuestas según el caso). Las cámaras 1, 2 y 4 votan el número pero no la dirección.
+Las 4 cámaras ven el depósito desde ángulos distintos. Solo **Cam 1** (cámara de la barrera) puede distinguir entrada de salida de forma confiable: los buses que cruzan de derecha a izquierda están entrando y de izquierda a derecha están saliendo. Las cámaras 2, 3 y 4 votan el número pero no la dirección.
 
-La dirección se determina por el desplazamiento horizontal neto del bus a través de los frames (`MotionFilter` en `rtsp_multicam.py`).
+La dirección se determina por cruce de líneas virtuales (zona A exterior / zona B interior) y como fallback por el desplazamiento horizontal neto del bus a través de los frames (`MotionFilter` en `rtsp_multicam.py`).
 
 ## Arquitectura multi-cámara
 
@@ -105,6 +105,35 @@ fonobus/
     ├── test_roi.py             Visualizar extracción de zonas ROI
     └── scan_cameras.py         Escanear canales RTSP disponibles
 ```
+
+## Dashboard web
+
+El sistema incluye un dashboard en tiempo real accesible desde el browser.
+
+**Iniciar servidor:**
+```bash
+.venv/bin/python -m uvicorn web.app:app --port 8000
+```
+
+Abrí `http://localhost:8000` en el browser. El dashboard incluye tres tabs:
+
+- **Detecciones** — feed en tiempo real de cada bus detectado (número, dirección, hora, captura)
+- **Estadísticas** — actividad por hora, buses más frecuentes, resumen por día
+- **Por Bus** — registro agrupado por número de flota: entradas, salidas y todas las capturas históricas de cada bus. Clic en una fila para expandir y ver las imágenes con horario
+
+Las detecciones llegan al browser vía WebSocket sin necesidad de recargar.
+
+**API endpoints:**
+
+| Endpoint | Descripción |
+|----------|-------------|
+| `GET /api/detecciones` | Últimas detecciones (paginado) |
+| `GET /api/stats/por-hora` | Actividad agrupada por hora |
+| `GET /api/stats/por-dia` | Actividad de los últimos 30 días |
+| `GET /api/stats/frecuentes` | Top 10 buses más detectados |
+| `GET /api/stats/por-numero` | Registro completo por número de flota con capturas |
+| `GET /captures/<filename>` | Sirve las imágenes capturadas |
+| `WS  /ws` | Stream de eventos en tiempo real |
 
 ## Capturas
 
