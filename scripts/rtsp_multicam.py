@@ -38,7 +38,7 @@ from filters.candidate_filter import select_best
 from web.database import init_db, insertar as db_insertar
 from web.app import emit_event
 
-BASE_URL = "rtsp://test:fono1234@190.220.138.178:34224/cam/realmonitor"
+BASE_URL = "rtsp://test:fono1234@192.168.1.63:34224/cam/realmonitor"
 RECONNECT_DELAY = 5
 
 CAMERAS = {
@@ -56,6 +56,15 @@ TILE_H = 360
 
 # Cam 1 is at the barrier — the only camera where direction is unambiguous.
 DIRECTION_CAM = "Cam 1"
+
+# Cameras with a fixed direction assignment — any moving bus on these cameras
+# is always reported with this direction, regardless of motion analysis.
+# Cam 1 (barrera): solo detecta entradas (buses que vienen del exterior).
+# Cam 2 (lateral):  solo detecta salidas (buses que salen al exterior).
+CAM_FIXED_DIRECTION: dict[str, str] = {
+    "Cam 1": "entering",
+    "Cam 2": "exiting",
+}
 
 # Per-camera exclusion zones: detections whose center falls inside are ignored
 # completely (no MotionFilter slot created). Coordinates as fractions of frame size.
@@ -75,9 +84,19 @@ ORIENTATION_TO_DIRECTION: dict[str, dict[str, str]] = {
 
 # Virtual barrier lines for Cam 1, as a fraction of frame width.
 # A bus whose center crosses the RED line first is entering (comes from outside/right).
-# A bus whose center crosses the YELLOW line first is exiting (leaves to outside/right).
-CAM1_LINE_RED_X    = 0.80   # right barrier
-CAM1_LINE_YELLOW_X = 0.18   # left barrier
+CAM1_LINE_RED_X    = 0.80   # right barrier (entrada) — also shown as red zone in overlay
+CAM1_LINE_YELLOW_X = 0.18   # left barrier — used only for zone detection logic (no longer shown in overlay)
+
+# Yellow zone for Cam 2 (salida): fraction of frame width where the exit zone is drawn.
+CAM2_LINE_YELLOW_X = 0.75   # adjust to match where exiting buses appear in Cam 2
+
+# Zone crossing trigger: bus must completely traverse this zone (right→left) to fire a detection.
+# Maps cam_label → fraction of frame width that defines the LEFT edge of the trigger zone.
+# The zone spans from this x to the right edge of the frame.
+ZONE_X_FRACS: dict[str, float] = {
+    "Cam 1": CAM1_LINE_RED_X,
+    "Cam 2": CAM2_LINE_YELLOW_X,
+}
 
 # Fallback: if no line crossing is detected, use net horizontal displacement.
 # net_dx < -MIN_DIRECTION_PX → entering (moving left), net_dx > MIN_DIRECTION_PX → exiting.
@@ -134,10 +153,12 @@ class MotionFilter:
                 best_id = sid
         return best_id
 
-    def is_moving(self, detection: BusDetection, frame_width: int = 0) -> bool:
+    def is_moving(self, detection: BusDetection, frame_width: int = 0,
+                  zone_x_frac: float | None = None) -> bool:
         """
         Returns True if the bus is actively moving.
         frame_width: pass frame.shape[1] for Cam 1 to enable line-crossing tracking.
+        zone_x_frac: if set, tracks whether bus center is inside the trigger zone (cx > zone_x).
         """
         x1, y1, x2, y2 = detection.bbox
         cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
@@ -158,6 +179,8 @@ class MotionFilter:
                 "first_seen_time": now,
                 "last_seen_time": now,
                 "zones_visited": [],          # ordered list of zones visited ("A", "B")
+                "in_zone": False,             # bus center was seen inside trigger zone
+                "crossing_fired": False,      # zone crossing already triggered once
             }
             self._next_slot += 1
             return False
@@ -205,6 +228,11 @@ class MotionFilter:
         slot["cy"] = cy
         slot["last_seen_time"] = now
 
+        # Zone tracking: mark if bus center is inside the trigger zone
+        if zone_x_frac is not None and frame_width > 0:
+            if cx > frame_width * zone_x_frac:
+                slot["in_zone"] = True
+
         # Activation check: use the EMA position instead of raw cx to filter YOLO
         # bbox jitter. Jitter oscillates → EMA stays near cx_first. Real movement
         # accumulates → EMA drifts away. Only activate when EMA displacement exceeds
@@ -221,6 +249,27 @@ class MotionFilter:
         # If the EMA already confirmed real movement, don't block on per-frame threshold.
         # static_count only blocks when the bus hasn't moved at all recently.
         return slot["static_count"] < max(self.static_limit, 8)
+
+    def check_zone_crossing(self, detection: BusDetection, frame_width: int,
+                            zone_x_frac: float) -> bool:
+        """
+        Returns True (once per slot) when the bus has completely crossed the trigger zone
+        from right to left: was seen with cx > zone_x, now seen with cx < zone_x.
+        After returning True, sets crossing_fired to prevent re-triggering.
+        """
+        x1, y1, x2, y2 = detection.bbox
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        sid = self._find_slot(cx, cy)
+        if sid is None:
+            return False
+        slot = self._slots[sid]
+        if slot.get("crossing_fired"):
+            return False
+        zone_x = frame_width * zone_x_frac
+        if slot.get("in_zone") and cx < zone_x:
+            slot["crossing_fired"] = True
+            return True
+        return False
 
     def get_direction(self, detection: BusDetection) -> str | None:
         """
@@ -275,26 +324,21 @@ class MotionFilter:
     def draw_cam1_overlay(self, frame: np.ndarray) -> np.ndarray:
         """
         Draw direction debug overlay on a copy of a Cam 1 frame.
-        Shows virtual barrier lines, bus trajectory, net_dx, and direction state.
+        Shows the red entry zone, bus trajectory, net_dx, and direction state.
         """
         out = frame.copy()
         h, w = out.shape[:2]
 
-        # Virtual barrier lines
-        red_x    = int(w * CAM1_LINE_RED_X)
-        yellow_x = int(w * CAM1_LINE_YELLOW_X)
-        cv2.line(out, (red_x, 0),    (red_x, h),    (0, 0, 255),   2)
-        cv2.line(out, (yellow_x, 0), (yellow_x, h), (0, 255, 255), 2)
-        cv2.putText(out, "ENTRA", (red_x - 60, 20),    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255),   1)
-        cv2.putText(out, "SALE",  (yellow_x + 5, 20),  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        # Red barrier line (entrada only)
+        red_x = int(w * CAM1_LINE_RED_X)
+        cv2.line(out, (red_x, 0), (red_x, h), (0, 0, 255), 2)
+        cv2.putText(out, "ENTRA", (red_x - 60, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-        # Zone overlays (semitransparent)
+        # Red zone overlay (semitransparent)
         overlay_zones = out.copy()
-        cv2.rectangle(overlay_zones, (red_x, 0), (w, h), (0, 0, 255), -1)       # red = Zona A (exterior)
-        cv2.rectangle(overlay_zones, (0, 0), (yellow_x, h), (0, 255, 255), -1)  # yellow = Zona B (depósito)
+        cv2.rectangle(overlay_zones, (red_x, 0), (w, h), (0, 0, 255), -1)
         cv2.addWeighted(overlay_zones, 0.08, out, 0.92, 0, out)
         cv2.putText(out, "ZONA A (ext)", (red_x + 5, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
-        cv2.putText(out, "ZONA B (dep)", (5, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
         now = time.monotonic()
         for slot in self._slots.values():
@@ -321,6 +365,27 @@ class MotionFilter:
             dx_text   = f"dx={int(net_dx)} zones={zones_str} {dir_text}"
             cv2.putText(out, dx_text, (cx_last + 8, cy - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1)
+
+        return out
+
+    def draw_cam2_overlay(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Draw exit zone overlay on a copy of a Cam 2 frame.
+        Shows the yellow exit zone where exiting buses are tracked.
+        """
+        out = frame.copy()
+        h, w = out.shape[:2]
+
+        # Yellow barrier line (salida)
+        yellow_x = int(w * CAM2_LINE_YELLOW_X)
+        cv2.line(out, (yellow_x, 0), (yellow_x, h), (0, 255, 255), 2)
+        cv2.putText(out, "SALE", (yellow_x + 5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+        # Yellow zone overlay (semitransparent)
+        overlay_zones = out.copy()
+        cv2.rectangle(overlay_zones, (yellow_x, 0), (w, h), (0, 255, 255), -1)
+        cv2.addWeighted(overlay_zones, 0.08, out, 0.92, 0, out)
+        cv2.putText(out, "ZONA B (sal)", (yellow_x + 5, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
         return out
 
@@ -525,14 +590,17 @@ class ConsensusBuffer:
                     self._votes = [(number, direction, cam_label)]
                     self._first_crop = crop   # save crop at first sighting
                     events.append(("provisional", number, direction, cam_label))
+                    # Authoritative cameras (Cam 1/Cam 2) confirm immediately — no second vote needed
+                    if cam_label in CAM_FIXED_DIRECTION:
+                        events.extend(self._close(now))
             else:
                 # Window already open
                 if result is not None:
                     number, direction = result
                     self._votes.append((number, direction, cam_label))
-                    # Close immediately on second vote from a different camera
                     cams_voted = {lbl for _, _, lbl in self._votes}
-                    if len(cams_voted) >= 2:
+                    # Close immediately if authoritative camera voted or second camera confirmed
+                    if cam_label in CAM_FIXED_DIRECTION or len(cams_voted) >= 2:
                         events.extend(self._close(now))
                 elif now - self._window_start >= self.max_window_sec:
                     events.extend(self._close(now))
@@ -719,7 +787,7 @@ def yolo_worker(
                 print(f"  [{state.label}] YOLO ERROR: {e}")
                 best, bus_crop, bbox_ratio = None, None, 0.0
 
-            # Update Cam 1 direction overlay regardless of OCR
+            # Update direction overlays regardless of OCR result
             if state.label == DIRECTION_CAM:
                 try:
                     annotated = motion_filter.draw_cam1_overlay(frame)
@@ -729,10 +797,19 @@ def yolo_worker(
                 with state.lock:
                     state.overlay_frame = annotated
                     state.overlay_ts = time.monotonic()
+            elif state.label == "Cam 2":
+                try:
+                    annotated = motion_filter.draw_cam2_overlay(frame)
+                except Exception as e:
+                    print(f"  [{state.label}] OVERLAY ERROR: {e}")
+                    annotated = None
+                with state.lock:
+                    state.overlay_frame = annotated
+                    state.overlay_ts = time.monotonic()
 
             if best is None or bus_crop is None:
                 # No moving bus — clear overlay so display falls back to live frame
-                if state.label != DIRECTION_CAM:
+                if state.label not in (DIRECTION_CAM, "Cam 2"):
                     with state.lock:
                         state.overlay_frame = None
                         state.overlay_ts = time.monotonic()
@@ -778,7 +855,8 @@ def _yolo_detect(
         return None, None, 0.0
 
     fh_frame, fw_frame = frame.shape[:2]
-    fw = fw_frame if label == DIRECTION_CAM else 0
+    zone_x_frac = ZONE_X_FRACS.get(label)
+    fw = fw_frame if (label == DIRECTION_CAM or zone_x_frac is not None) else 0
     exclusions = EXCLUDE_ZONES.get(label, [])
     moving = []
 
@@ -803,7 +881,7 @@ def _yolo_detect(
         if bus_w < min_bbox or bus_h < min_bbox:
             if debug:
                 print(f"  [{label}] SKIP: bbox demasiado pequeño ({bus_w}×{bus_h}px < {min_bbox}px)")
-            motion_filter.is_moving(det, frame_width=fw)
+            motion_filter.is_moving(det, frame_width=fw, zone_x_frac=zone_x_frac)
             continue
 
         # Freeze zone tracking when bus fills most of the frame — cx is near center
@@ -811,7 +889,7 @@ def _yolo_detect(
         det_ratio = (bus_w * bus_h) / (fw_frame * fh_frame)
         fw_for_motion = 0 if (fw > 0 and det_ratio > 0.60) else fw
 
-        if not motion_filter.is_moving(det, frame_width=fw_for_motion):
+        if not motion_filter.is_moving(det, frame_width=fw_for_motion, zone_x_frac=zone_x_frac):
             if debug:
                 print(f"  [{label}] SKIP: bus estático (no se movió o estacionado)")
             continue
@@ -955,6 +1033,23 @@ def _run_ocr(bus_crop, best, frame, bbox_ratio, fw, fh,
             dump_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%H%M%S_%f")[:9]
             cv2.imwrite(str(dump_dir / f"{ts}_{label.replace(' ','')}_normal.jpg"), bus_crop)
+
+    # For zone-trigger cameras (Cam 1 / Cam 2): only report if bus has completely
+    # crossed through the trigger zone (right→left). Without a completed crossing,
+    # discard the OCR result — the bus hasn't passed the gate yet.
+    zone_x_frac = ZONE_X_FRACS.get(label)
+    if zone_x_frac is not None:
+        if not motion_filter.check_zone_crossing(best, fw, zone_x_frac):
+            if debug:
+                print(f"  [{label}] MOONDREAM: {number if number else 'none'} — sin cruce de zona, descartando")
+            return None
+        # Crossing confirmed — assign fixed direction
+        direction = CAM_FIXED_DIRECTION[label]
+    else:
+        # Override direction with fixed assignment if configured for this camera
+        fixed_dir = CAM_FIXED_DIRECTION.get(label)
+        if fixed_dir:
+            direction = fixed_dir
 
     if debug:
         print(f"  [{label}] MOONDREAM: {number if number else 'none'} dir={direction}")
