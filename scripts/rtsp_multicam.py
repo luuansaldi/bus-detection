@@ -38,7 +38,7 @@ from filters.candidate_filter import select_best
 from web.database import init_db, insertar as db_insertar
 from web.app import emit_event
 
-BASE_URL = "rtsp://test:fono1234@192.168.1.63:34224/cam/realmonitor"
+BASE_URL = "rtsp://test:fono1234@190.220.138.178:34224/cam/realmonitor"
 RECONNECT_DELAY = 5
 
 CAMERAS = {
@@ -84,7 +84,7 @@ ORIENTATION_TO_DIRECTION: dict[str, dict[str, str]] = {
 
 # Virtual barrier lines for Cam 1, as a fraction of frame width.
 # A bus whose center crosses the RED line first is entering (comes from outside/right).
-CAM1_LINE_RED_X    = 0.80   # right barrier (entrada) — also shown as red zone in overlay
+CAM1_LINE_RED_X    = 0.65   # right barrier (entrada) — also shown as red zone in overlay
 CAM1_LINE_YELLOW_X = 0.18   # left barrier — used only for zone detection logic (no longer shown in overlay)
 
 # Yellow zone for Cam 2 (salida): fraction of frame width where the exit zone is drawn.
@@ -122,6 +122,14 @@ CAM1_ZONE_B_MAX_X = CAM1_LINE_YELLOW_X   # zona B: cx < this fraction of frame w
 # → treated as parked; will not vote in the consensus buffer.
 PARKED_TIMEOUT_SEC = 30.0
 
+# Fallback for large/fast buses on zone-trigger cameras:
+# YOLO sometimes first detects a bus AFTER it has already crossed zone_x
+# (bus enters from off-screen and traverses zone in < 1 YOLO frame).
+# If the bus bbox area is > this threshold (close to camera = in exit lane)
+# AND has moved leftward by > ZONE_FALLBACK_MIN_DX_PX, fire the crossing.
+ZONE_FALLBACK_AREA   = 300_000   # px² — large bus = close to camera
+ZONE_FALLBACK_MIN_DX = 20        # px  — minimum leftward movement to fire fallback
+
 
 # ── A: Static bus filter + direction tracker ──────────────────────────────────
 
@@ -142,8 +150,17 @@ class MotionFilter:
         self._slots: dict[int, dict] = {}
         self._next_slot: int = 0
 
+    def _purge_stale_slots(self, max_age_sec: float = 8.0) -> None:
+        """Remove slots not seen in the last max_age_sec seconds."""
+        now = time.monotonic()
+        stale = [sid for sid, slot in self._slots.items()
+                 if now - slot["last_seen_time"] > max_age_sec]
+        for sid in stale:
+            del self._slots[sid]
+
     def _find_slot(self, cx: float, cy: float) -> int | None:
         """Return the nearest slot within slot_radius, or None."""
+        self._purge_stale_slots()
         best_id = None
         best_dist = float("inf")
         for sid, slot in self._slots.items():
@@ -166,7 +183,11 @@ class MotionFilter:
 
         sid = self._find_slot(cx, cy)
         if sid is None:
-            # New bus — create slot, skip this frame
+            # New bus — create slot, skip this frame.
+            # in_zone is set immediately if the bus appears inside the trigger zone
+            # on its first detection (fast buses may only appear in 1-2 YOLO frames).
+            in_zone_now = (zone_x_frac is not None and frame_width > 0
+                           and cx > frame_width * zone_x_frac)
             self._slots[self._next_slot] = {
                 "cx_last": cx, "cy": cy,
                 "cx_first": cx, "cy_first": cy,
@@ -179,8 +200,9 @@ class MotionFilter:
                 "first_seen_time": now,
                 "last_seen_time": now,
                 "zones_visited": [],          # ordered list of zones visited ("A", "B")
-                "in_zone": False,             # bus center was seen inside trigger zone
+                "in_zone": in_zone_now,       # bus center was seen inside trigger zone
                 "crossing_fired": False,      # zone crossing already triggered once
+                "max_area": 0,               # largest bbox area seen (for fallback)
             }
             self._next_slot += 1
             return False
@@ -227,6 +249,7 @@ class MotionFilter:
         slot["cx_last"] = cx
         slot["cy"] = cy
         slot["last_seen_time"] = now
+        slot["max_area"] = max(slot.get("max_area", 0), detection.area)
 
         # Zone tracking: mark if bus center is inside the trigger zone
         if zone_x_frac is not None and frame_width > 0:
@@ -266,9 +289,29 @@ class MotionFilter:
         if slot.get("crossing_fired"):
             return False
         zone_x = frame_width * zone_x_frac
-        if slot.get("in_zone") and cx < zone_x:
+        # Use cx_last (most recent YOLO position) rather than the queued detection's cx.
+        # The crop is queued while the bus is still *inside* the zone (cx > zone_x);
+        # by the time OCR finishes, YOLO has advanced and cx_last reflects the exit.
+        current_cx = slot["cx_last"]
+
+        # Primary path: bus was explicitly seen inside zone then exited.
+        if slot.get("in_zone") and current_cx < zone_x:
             slot["crossing_fired"] = True
             return True
+
+        # Fallback for large/fast buses: YOLO only caught the bus AFTER it had
+        # already crossed zone_x (bus entered from off-screen on the right and
+        # the zone traversal happened between YOLO frames).
+        # Use max_area (largest bbox seen in this slot) instead of the queued
+        # detection's area — the bus grows as it approaches and may have been
+        # small when first enqueued.
+        net_leftward = slot["cx_first"] - current_cx  # positive = moved left
+        effective_area = max(slot.get("max_area", 0), detection.area)
+        if (effective_area >= ZONE_FALLBACK_AREA and
+                net_leftward >= ZONE_FALLBACK_MIN_DX):
+            slot["crossing_fired"] = True
+            return True
+
         return False
 
     def get_direction(self, detection: BusDetection) -> str | None:
@@ -1039,6 +1082,21 @@ def _run_ocr(bus_crop, best, frame, bbox_ratio, fw, fh,
     # discard the OCR result — the bus hasn't passed the gate yet.
     zone_x_frac = ZONE_X_FRACS.get(label)
     if zone_x_frac is not None:
+        if debug:
+            # Peek at slot state to diagnose zone crossing failures
+            x1d, y1d, x2d, y2d = best.bbox
+            cxd = (x1d + x2d) / 2
+            cyd = (y1d + y2d) / 2
+            sid = motion_filter._find_slot(cxd, cyd)
+            if sid is not None:
+                sl = motion_filter._slots[sid]
+                net_left = sl['cx_first'] - sl['cx_last']
+                print(f"  [{label}] ZONA CHECK: queued_cx={cxd:.0f} cx_first={sl['cx_first']:.0f} "
+                      f"cx_last={sl['cx_last']:.0f} zone_x={fw * zone_x_frac:.0f} "
+                      f"in_zone={sl.get('in_zone')} fired={sl.get('crossing_fired')} "
+                      f"area={best.area:.0f} net_left={net_left:.0f}")
+            else:
+                print(f"  [{label}] ZONA CHECK: slot no encontrado para queued_cx={cxd:.0f}")
         if not motion_filter.check_zone_crossing(best, fw, zone_x_frac):
             if debug:
                 print(f"  [{label}] MOONDREAM: {number if number else 'none'} — sin cruce de zona, descartando")
@@ -1053,6 +1111,16 @@ def _run_ocr(bus_crop, best, frame, bbox_ratio, fw, fh,
 
     if debug:
         print(f"  [{label}] MOONDREAM: {number if number else 'none'} dir={direction}")
+
+    if number is None and zone_x_frac is not None:
+        # OCR failed on this crop — reset crossing_fired so the next crop can retry.
+        # The ConsensusBuffer per-number cooldown handles dedup; we don't need
+        # crossing_fired to stay True when we haven't read anything yet.
+        x1r, y1r, x2r, y2r = best.bbox
+        sid = motion_filter._find_slot((x1r + x2r) / 2, (y1r + y2r) / 2)
+        if sid is not None:
+            motion_filter._slots[sid]["crossing_fired"] = False
+
     return (number, direction) if number else None
 
 
@@ -1084,9 +1152,9 @@ def _report(number: int, direction: str, frame: np.ndarray, all_states: dict) ->
     ts_file = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     if direction == "entering":
-        action = "Entró"
+        action = "Entro"
     elif direction == "exiting":
-        action = "Salió"
+        action = "Salio"
     else:
         action = ""
 
