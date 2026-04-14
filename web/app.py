@@ -17,11 +17,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from web.database import init_db, obtener, obtener_crops, stats_por_hora, stats_por_dia, stats_frecuentes, stats_por_numero, limpiar_capturas_antiguas
+from web.database import (init_db, obtener, obtener_crops, stats_por_hora, stats_por_dia,
+                           stats_frecuentes, stats_por_numero, limpiar_capturas_antiguas,
+                           get_comparacion, get_deteccion_by_id)
 from config.settings import CAPTURES_RETENTION_DAYS
 
 CAPTURES_DIR = Path(__file__).resolve().parent.parent / "captures"
@@ -32,7 +34,7 @@ app = FastAPI(title="Fonobus API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -154,6 +156,26 @@ def get_stats_por_numero():
 def get_detection_crops(detection_id: int):
     crops = obtener_crops(detection_id)
     return JSONResponse(content=crops)
+
+
+@app.post("/api/comparaciones/{comp_id}/reintentar")
+def reintentar_comparacion(comp_id: int):
+    comp = get_comparacion(comp_id)
+    if not comp:
+        raise HTTPException(status_code=404, detail="Comparación no encontrada")
+    if comp["resultado"] not in ("error", "inconcluye"):
+        raise HTTPException(status_code=400, detail="Solo se pueden reintentar análisis con resultado error o inconcluye")
+    sal = get_deteccion_by_id(comp["salida_id"])
+    ent = get_deteccion_by_id(comp["entrada_id"])
+    if not sal or not ent:
+        raise HTTPException(status_code=404, detail="Detecciones originales no encontradas")
+    from web.damage_detector import comparar_viaje_async
+    comparar_viaje_async(
+        comp["numero_flota"],
+        sal["imagen_path"], ent["imagen_path"],
+        comp["salida_id"], comp["entrada_id"],
+    )
+    return JSONResponse(content={"status": "reintentando"})
 
 
 @app.get("/captures/{filename}")
