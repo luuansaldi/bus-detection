@@ -22,7 +22,7 @@ def get_conn() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Crea la tabla si no existe. Seguro de llamar múltiples veces."""
+    """Crea las tablas si no existen. Seguro de llamar múltiples veces."""
     with get_conn() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS detecciones (
@@ -33,16 +33,54 @@ def init_db() -> None:
                 imagen_path  TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS comparaciones (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                numero_flota       INTEGER NOT NULL,
+                salida_id          INTEGER REFERENCES detecciones(id),
+                entrada_id         INTEGER REFERENCES detecciones(id),
+                resultado          TEXT,
+                descripcion        TEXT,
+                timestamp_analisis TEXT NOT NULL
+            )
+        """)
 
 
-def insertar(numero_flota: int, direccion: str, imagen_path: str | None = None) -> None:
-    """Inserta una detección confirmada."""
+def insertar(numero_flota: int, direccion: str, imagen_path: str | None = None) -> int:
+    """Inserta una detección confirmada. Retorna el id del registro creado."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with get_conn() as conn:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO detecciones (timestamp, numero_flota, direccion, imagen_path) VALUES (?, ?, ?, ?)",
             (ts, numero_flota, direccion, imagen_path),
         )
+        return cur.lastrowid
+
+
+def get_ultima_salida(numero_flota: int) -> dict | None:
+    """Retorna la detección exiting más reciente del bus, o None si no existe."""
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT id, imagen_path FROM detecciones
+               WHERE numero_flota = ? AND direccion = 'exiting'
+               ORDER BY timestamp DESC LIMIT 1""",
+            (numero_flota,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def insertar_comparacion(numero_flota: int, salida_id: int, entrada_id: int,
+                          resultado: str, descripcion: str) -> int:
+    """Guarda el resultado de la comparación de daños. Retorna el id."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO comparaciones
+               (numero_flota, salida_id, entrada_id, resultado, descripcion, timestamp_analisis)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (numero_flota, salida_id, entrada_id, resultado, descripcion, ts),
+        )
+        return cur.lastrowid
 
 
 def stats_por_hora() -> list[dict]:
@@ -114,12 +152,19 @@ def stats_por_numero() -> list[dict]:
                 WHERE numero_flota = ?
                 ORDER BY timestamp ASC
             """, (bus["numero_flota"],)).fetchall()
+            ultimo_analisis = conn.execute("""
+                SELECT resultado, descripcion, timestamp_analisis
+                FROM comparaciones
+                WHERE numero_flota = ?
+                ORDER BY id DESC LIMIT 1
+            """, (bus["numero_flota"],)).fetchone()
             result.append({
-                "numero_flota": bus["numero_flota"],
-                "total":        bus["total"],
-                "entradas":     bus["entradas"],
-                "salidas":      bus["salidas"],
-                "capturas":     [dict(c) for c in capturas],
+                "numero_flota":   bus["numero_flota"],
+                "total":          bus["total"],
+                "entradas":       bus["entradas"],
+                "salidas":        bus["salidas"],
+                "capturas":       [dict(c) for c in capturas],
+                "ultimo_analisis": dict(ultimo_analisis) if ultimo_analisis else None,
             })
     return result
 
