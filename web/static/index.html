@@ -162,6 +162,11 @@
     .badge.danos    { background: #2d0f0f; color: #f87171; border: 1px solid #7f1d1d; }
     .badge.analisis { background: #1a1f2e; color: #94a3b8; border: 1px solid #374151; }
 
+    .damage-desc {
+      font-size: 11px; color: #f87171; margin-top: 3px;
+      max-width: 240px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+
     .ts { color: #6b7280; font-size: 13px; font-variant-numeric: tabular-nums; }
 
     .thumb-wrap {
@@ -568,10 +573,11 @@
       }
 
       if (msg.type === 'damage_analysis') {
-        updateDamageBadge(msg.numero_flota, msg.resultado, msg.descripcion);
+        updateDamageBadge(msg.numero_flota, msg.resultado, msg.severidad, msg.descripcion);
         if (busRegistry[msg.numero_flota]) {
           busRegistry[msg.numero_flota].ultimo_analisis = {
             resultado: msg.resultado,
+            severidad: msg.severidad,
             descripcion: msg.descripcion,
             timestamp_analisis: msg.timestamp,
           };
@@ -706,10 +712,35 @@
   function damageBadgeHtml(analisis) {
     if (!analisis) return '<span class="badge analisis" title="Sin análisis aún">—</span>';
     if (analisis.resultado === 'ok')
-      return `<span class="badge ok" title="${analisis.descripcion}">✓ OK</span>`;
-    if (analisis.resultado === 'danos')
-      return `<span class="badge danos" title="${analisis.descripcion}">⚠ Daños</span>`;
-    return `<span class="badge analisis" title="${analisis.descripcion}">Error</span>`;
+      return `<span class="badge ok">✓ OK</span>`;
+    if (analisis.resultado === 'danos') {
+      const sev = analisis.severidad && analisis.severidad !== 'desconocida' && analisis.severidad !== 'ninguna'
+        ? ` (${analisis.severidad})` : '';
+      return `<div>
+        <span class="badge danos">⚠ Daños${sev}</span>
+        <div class="damage-desc">${analisis.descripcion || ''}</div>
+      </div>`;
+    }
+    if (analisis.resultado === 'inconcluye') {
+      const retryBtn = analisis.id
+        ? `<button onclick="reintentarAnalisis(${analisis.id})" title="Reintentar análisis"
+             style="margin-left:6px;background:none;border:none;color:#94a3b8;cursor:pointer;font-size:13px">↺</button>`
+        : '';
+      return `<span class="badge analisis" title="${analisis.descripcion}">? Inconcluye${retryBtn}</span>`;
+    }
+    // resultado === 'error'
+    const retryBtn = analisis.id
+      ? `<button onclick="reintentarAnalisis(${analisis.id})" title="Reintentar análisis"
+           style="margin-left:6px;background:none;border:none;color:#94a3b8;cursor:pointer;font-size:13px">↺</button>`
+      : '';
+    return `<span class="badge analisis" title="${analisis.descripcion}">Error${retryBtn}</span>`;
+  }
+
+  async function reintentarAnalisis(compId) {
+    try {
+      const r = await fetch(`/api/comparaciones/${compId}/reintentar`, { method: 'POST' });
+      if (!r.ok) { const e = await r.json(); alert('Error: ' + (e.detail || r.status)); }
+    } catch(e) { alert('Error al reintentar: ' + e.message); }
   }
 
   function busRowHtml(b) {
@@ -762,10 +793,11 @@
     </div>`;
   }
 
-  function updateDamageBadge(numero_flota, resultado, descripcion) {
+  function updateDamageBadge(numero_flota, resultado, severidad, descripcion) {
     const cell = document.getElementById('damage-bus-' + numero_flota);
     if (!cell) return;
-    cell.innerHTML = damageBadgeHtml({ resultado, descripcion });
+    const analisis = busRegistry[numero_flota]?.ultimo_analisis || {};
+    cell.innerHTML = damageBadgeHtml({ resultado, severidad, descripcion, id: analisis.id });
   }
 
   function toggleBus(numero_flota) {

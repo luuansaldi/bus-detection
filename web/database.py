@@ -49,10 +49,16 @@ def init_db() -> None:
                 salida_id          INTEGER REFERENCES detecciones(id),
                 entrada_id         INTEGER REFERENCES detecciones(id),
                 resultado          TEXT,
+                severidad          TEXT,
                 descripcion        TEXT,
                 timestamp_analisis TEXT NOT NULL
             )
         """)
+        # Migración: agrega columna severidad si no existe (para DBs anteriores)
+        try:
+            conn.execute("ALTER TABLE comparaciones ADD COLUMN severidad TEXT DEFAULT 'desconocida'")
+        except Exception:
+            pass
 
 
 def insertar(numero_flota: int, direccion: str, imagen_path: str | None = None,
@@ -108,17 +114,36 @@ def get_ultima_salida(numero_flota: int) -> dict | None:
 
 
 def insertar_comparacion(numero_flota: int, salida_id: int, entrada_id: int,
-                          resultado: str, descripcion: str) -> int:
+                          resultado: str, descripcion: str,
+                          severidad: str = "desconocida") -> int:
     """Guarda el resultado de la comparación de daños. Retorna el id."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with get_conn() as conn:
         cur = conn.execute(
             """INSERT INTO comparaciones
-               (numero_flota, salida_id, entrada_id, resultado, descripcion, timestamp_analisis)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (numero_flota, salida_id, entrada_id, resultado, descripcion, ts),
+               (numero_flota, salida_id, entrada_id, resultado, severidad, descripcion, timestamp_analisis)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (numero_flota, salida_id, entrada_id, resultado, severidad, descripcion, ts),
         )
         return cur.lastrowid
+
+
+def get_comparacion(comp_id: int) -> dict | None:
+    """Retorna una comparación por id."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM comparaciones WHERE id = ?", (comp_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_deteccion_by_id(det_id: int) -> dict | None:
+    """Retorna una detección por id."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM detecciones WHERE id = ?", (det_id,)
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def stats_por_hora() -> list[dict]:
@@ -200,7 +225,7 @@ def stats_por_numero() -> list[dict]:
                 cap["crops"] = [dict(cr) for cr in crops]
                 capturas_list.append(cap)
             ultimo_analisis = conn.execute("""
-                SELECT resultado, descripcion, timestamp_analisis
+                SELECT id, resultado, severidad, descripcion, timestamp_analisis
                 FROM comparaciones
                 WHERE numero_flota = ?
                 ORDER BY id DESC LIMIT 1
