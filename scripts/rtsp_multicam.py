@@ -35,7 +35,7 @@ from roi.extractor import extract_rois, extract_full_bus_crop
 from preprocessing.image_processor import process
 from ocr.reader import read_candidates
 from filters.candidate_filter import select_best
-from web.database import init_db, insertar as db_insertar
+from web.database import init_db, insertar as db_insertar, get_ultima_salida as db_get_ultima_salida
 from web.app import emit_event
 
 BASE_URL = "rtsp://test:fono1234@190.220.138.178:34224/cam/realmonitor"
@@ -1167,7 +1167,7 @@ def _report(number: int, direction: str, frame: np.ndarray, all_states: dict) ->
     tag = f"_{direction}" if direction != "unknown" else ""
     filename = captures_dir / f"{ts_file}_{number}{tag}.jpg"
     cv2.imwrite(str(filename), frame)
-    db_insertar(number, direction, str(filename))
+    nueva_id = db_insertar(number, direction, str(filename))
     emit_event({
         "type": "detection",
         "timestamp": ts_log,
@@ -1175,6 +1175,18 @@ def _report(number: int, direction: str, frame: np.ndarray, all_states: dict) ->
         "direccion": direction,
         "imagen_path": str(filename),
     })
+
+    if direction == "entering":
+        ultima_salida = db_get_ultima_salida(number)
+        if ultima_salida and ultima_salida.get("imagen_path"):
+            from web.damage_detector import comparar_viaje_async
+            comparar_viaje_async(
+                numero_flota=number,
+                salida_path=ultima_salida["imagen_path"],
+                entrada_path=str(filename),
+                salida_id=ultima_salida["id"],
+                entrada_id=nueva_id,
+            )
 
     for s in all_states.values():
         with s.lock:
