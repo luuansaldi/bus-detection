@@ -45,6 +45,18 @@ def insertar(numero_flota: int, direccion: str, imagen_path: str | None = None) 
         )
 
 
+def actualizar_direccion(numero_flota: int, direccion: str) -> bool:
+    """Actualiza la dirección de la detección más reciente de este bus (si era 'unknown')."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE detecciones SET direccion = ? "
+            "WHERE id = (SELECT id FROM detecciones WHERE numero_flota = ? "
+            "AND direccion = 'unknown' ORDER BY id DESC LIMIT 1)",
+            (direccion, numero_flota),
+        )
+        return cur.rowcount > 0
+
+
 def stats_por_hora() -> list[dict]:
     """Cantidad de detecciones agrupadas por hora del día (0-23)."""
     with get_conn() as conn:
