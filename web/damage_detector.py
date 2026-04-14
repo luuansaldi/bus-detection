@@ -56,7 +56,7 @@ def _comparar(numero_flota: int, salida_path: str, entrada_path: str,
         img_entrada = PIL.Image.open(entrada_path)
 
         resp = client.models.generate_content(
-            model="gemini-1.5-flash",
+            model="gemini-2.0-flash",
             contents=[img_salida, img_entrada, PROMPT.format(numero_flota=numero_flota)],
             config=types.GenerateContentConfig(
                 max_output_tokens=300,
