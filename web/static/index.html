@@ -158,6 +158,9 @@
     .badge.entering { background: #052e16; color: #4ade80; border: 1px solid #166534; }
     .badge.exiting  { background: #1c1917; color: #fb923c; border: 1px solid #78350f; }
     .badge.unknown  { background: #1a1f2e; color: #6b7280; border: 1px solid #374151; }
+    .badge.ok       { background: #052e16; color: #4ade80; border: 1px solid #166534; }
+    .badge.danos    { background: #2d0f0f; color: #f87171; border: 1px solid #7f1d1d; }
+    .badge.analisis { background: #1a1f2e; color: #94a3b8; border: 1px solid #374151; }
 
     .ts { color: #6b7280; font-size: 13px; font-variant-numeric: tabular-nums; }
 
@@ -431,10 +434,11 @@
             <th>Entradas</th>
             <th>Salidas</th>
             <th>Total</th>
+            <th>Estado</th>
           </tr>
         </thead>
         <tbody id="bus-tbody">
-          <tr><td colspan="5"><div class="empty-state"><div class="icon">🚌</div><p>Sin detecciones aún</p></div></td></tr>
+          <tr><td colspan="6"><div class="empty-state"><div class="icon">🚌</div><p>Sin detecciones aún</p></div></td></tr>
         </tbody>
       </table>
     </div>
@@ -562,6 +566,17 @@
       if (msg.type === 'camera_status') {
         setCamStatus(msg.cam, msg.connected);
       }
+
+      if (msg.type === 'damage_analysis') {
+        updateDamageBadge(msg.numero_flota, msg.resultado, msg.descripcion);
+        if (busRegistry[msg.numero_flota]) {
+          busRegistry[msg.numero_flota].ultimo_analisis = {
+            resultado: msg.resultado,
+            descripcion: msg.descripcion,
+            timestamp_analisis: msg.timestamp,
+          };
+        }
+      }
     };
 
     ws.onclose = () => {
@@ -682,10 +697,19 @@
     const tbody = document.getElementById('bus-tbody');
     const buses = Object.values(busRegistry).sort((a, b) => b.total - a.total);
     if (!buses.length) {
-      tbody.innerHTML = '<tr><td colspan="5"><div class="empty-state"><div class="icon">🚌</div><p>Sin detecciones aún</p></div></td></tr>';
+      tbody.innerHTML = '<tr><td colspan="6"><div class="empty-state"><div class="icon">🚌</div><p>Sin detecciones aún</p></div></td></tr>';
       return;
     }
     tbody.innerHTML = buses.map(b => busRowHtml(b)).join('');
+  }
+
+  function damageBadgeHtml(analisis) {
+    if (!analisis) return '<span class="badge analisis" title="Sin análisis aún">—</span>';
+    if (analisis.resultado === 'ok')
+      return `<span class="badge ok" title="${analisis.descripcion}">✓ OK</span>`;
+    if (analisis.resultado === 'danos')
+      return `<span class="badge danos" title="${analisis.descripcion}">⚠ Daños</span>`;
+    return `<span class="badge analisis" title="${analisis.descripcion}">Error</span>`;
   }
 
   function busRowHtml(b) {
@@ -696,9 +720,10 @@
         <td><span class="badge entering">↙ ${b.entradas}</span></td>
         <td><span class="badge exiting">↗ ${b.salidas}</span></td>
         <td style="color:#60a5fa;font-weight:600">${b.total}</td>
+        <td id="damage-${id}">${damageBadgeHtml(b.ultimo_analisis)}</td>
       </tr>
       <tr class="bus-row-captures" id="captures-${id}">
-        <td colspan="5">
+        <td colspan="6">
           <div class="captures-grid" id="grid-${id}">
             ${b.capturas.map(c => captureCardHtml(c)).join('')}
           </div>
@@ -735,6 +760,12 @@
       </div>
       ${cropsHtml}
     </div>`;
+  }
+
+  function updateDamageBadge(numero_flota, resultado, descripcion) {
+    const cell = document.getElementById('damage-bus-' + numero_flota);
+    if (!cell) return;
+    cell.innerHTML = damageBadgeHtml({ resultado, descripcion });
   }
 
   function toggleBus(numero_flota) {

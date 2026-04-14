@@ -42,23 +42,35 @@ def init_db() -> None:
                 FOREIGN KEY (detection_id) REFERENCES detecciones(id)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS comparaciones (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                numero_flota       INTEGER NOT NULL,
+                salida_id          INTEGER REFERENCES detecciones(id),
+                entrada_id         INTEGER REFERENCES detecciones(id),
+                resultado          TEXT,
+                descripcion        TEXT,
+                timestamp_analisis TEXT NOT NULL
+            )
+        """)
 
 
 def insertar(numero_flota: int, direccion: str, imagen_path: str | None = None,
-             crop_paths: dict[str, str] | None = None) -> None:
-    """Inserta una detección confirmada y opcionalmente los crops por cámara."""
+             crop_paths: dict[str, str] | None = None) -> int:
+    """Inserta una detección confirmada y opcionalmente los crops por cámara. Retorna el id."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO detecciones (timestamp, numero_flota, direccion, imagen_path) VALUES (?, ?, ?, ?)",
             (ts, numero_flota, direccion, imagen_path),
         )
+        det_id = cur.lastrowid
         if crop_paths:
-            det_id = cur.lastrowid
             conn.executemany(
                 "INSERT INTO detection_crops (detection_id, cam_label, crop_path) VALUES (?, ?, ?)",
                 [(det_id, cam, path) for cam, path in crop_paths.items()],
             )
+        return det_id
 
 
 def obtener_crops(detection_id: int) -> list[dict]:
@@ -81,6 +93,32 @@ def actualizar_direccion(numero_flota: int, direccion: str) -> bool:
             (direccion, numero_flota),
         )
         return cur.rowcount > 0
+
+
+def get_ultima_salida(numero_flota: int) -> dict | None:
+    """Retorna la detección exiting más reciente del bus, o None si no existe."""
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT id, imagen_path FROM detecciones
+               WHERE numero_flota = ? AND direccion = 'exiting'
+               ORDER BY timestamp DESC LIMIT 1""",
+            (numero_flota,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def insertar_comparacion(numero_flota: int, salida_id: int, entrada_id: int,
+                          resultado: str, descripcion: str) -> int:
+    """Guarda el resultado de la comparación de daños. Retorna el id."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO comparaciones
+               (numero_flota, salida_id, entrada_id, resultado, descripcion, timestamp_analisis)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (numero_flota, salida_id, entrada_id, resultado, descripcion, ts),
+        )
+        return cur.lastrowid
 
 
 def stats_por_hora() -> list[dict]:
@@ -161,12 +199,19 @@ def stats_por_numero() -> list[dict]:
                 ).fetchall()
                 cap["crops"] = [dict(cr) for cr in crops]
                 capturas_list.append(cap)
+            ultimo_analisis = conn.execute("""
+                SELECT resultado, descripcion, timestamp_analisis
+                FROM comparaciones
+                WHERE numero_flota = ?
+                ORDER BY id DESC LIMIT 1
+            """, (bus["numero_flota"],)).fetchone()
             result.append({
-                "numero_flota": bus["numero_flota"],
-                "total":        bus["total"],
-                "entradas":     bus["entradas"],
-                "salidas":      bus["salidas"],
-                "capturas":     capturas_list,
+                "numero_flota":    bus["numero_flota"],
+                "total":           bus["total"],
+                "entradas":        bus["entradas"],
+                "salidas":         bus["salidas"],
+                "capturas":        capturas_list,
+                "ultimo_analisis": dict(ultimo_analisis) if ultimo_analisis else None,
             })
     return result
 
