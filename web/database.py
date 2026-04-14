@@ -22,7 +22,7 @@ def get_conn() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Crea la tabla si no existe. Seguro de llamar múltiples veces."""
+    """Crea las tablas si no existen. Seguro de llamar múltiples veces."""
     with get_conn() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS detecciones (
@@ -33,16 +33,42 @@ def init_db() -> None:
                 imagen_path  TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS detection_crops (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                detection_id  INTEGER NOT NULL,
+                cam_label     TEXT    NOT NULL,
+                crop_path     TEXT    NOT NULL,
+                FOREIGN KEY (detection_id) REFERENCES detecciones(id)
+            )
+        """)
 
 
-def insertar(numero_flota: int, direccion: str, imagen_path: str | None = None) -> None:
-    """Inserta una detección confirmada."""
+def insertar(numero_flota: int, direccion: str, imagen_path: str | None = None,
+             crop_paths: dict[str, str] | None = None) -> None:
+    """Inserta una detección confirmada y opcionalmente los crops por cámara."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with get_conn() as conn:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO detecciones (timestamp, numero_flota, direccion, imagen_path) VALUES (?, ?, ?, ?)",
             (ts, numero_flota, direccion, imagen_path),
         )
+        if crop_paths:
+            det_id = cur.lastrowid
+            conn.executemany(
+                "INSERT INTO detection_crops (detection_id, cam_label, crop_path) VALUES (?, ?, ?)",
+                [(det_id, cam, path) for cam, path in crop_paths.items()],
+            )
+
+
+def obtener_crops(detection_id: int) -> list[dict]:
+    """Devuelve los crops por cámara de una detección."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT cam_label, crop_path FROM detection_crops WHERE detection_id = ? ORDER BY cam_label",
+            (detection_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def actualizar_direccion(numero_flota: int, direccion: str) -> bool:
@@ -126,12 +152,21 @@ def stats_por_numero() -> list[dict]:
                 WHERE numero_flota = ?
                 ORDER BY timestamp ASC
             """, (bus["numero_flota"],)).fetchall()
+            capturas_list = []
+            for c in capturas:
+                cap = dict(c)
+                crops = conn.execute(
+                    "SELECT cam_label, crop_path FROM detection_crops WHERE detection_id = ? ORDER BY cam_label",
+                    (c["id"],),
+                ).fetchall()
+                cap["crops"] = [dict(cr) for cr in crops]
+                capturas_list.append(cap)
             result.append({
                 "numero_flota": bus["numero_flota"],
                 "total":        bus["total"],
                 "entradas":     bus["entradas"],
                 "salidas":      bus["salidas"],
-                "capturas":     [dict(c) for c in capturas],
+                "capturas":     capturas_list,
             })
     return result
 
@@ -167,11 +202,31 @@ def limpiar_capturas_antiguas(retention_days: int) -> int:
                     archivos_borrados += 1
                 except OSError:
                     pass
+            # Borrar crops asociados
+            crop_filas = conn.execute(
+                "SELECT crop_path FROM detection_crops WHERE detection_id = ?",
+                (fila["id"],),
+            ).fetchall()
+            for cf in crop_filas:
+                cp = _Path(cf["crop_path"])
+                if not cp.is_absolute():
+                    cp = captures_dir / cp.name
+                if cp.exists():
+                    try:
+                        cp.unlink()
+                        archivos_borrados += 1
+                    except OSError:
+                        pass
             ids_limpiados.append(fila["id"])
 
         if ids_limpiados:
+            placeholders = ','.join('?' * len(ids_limpiados))
             conn.execute(
-                f"UPDATE detecciones SET imagen_path = NULL WHERE id IN ({','.join('?' * len(ids_limpiados))})",
+                f"UPDATE detecciones SET imagen_path = NULL WHERE id IN ({placeholders})",
+                ids_limpiados,
+            )
+            conn.execute(
+                f"DELETE FROM detection_crops WHERE detection_id IN ({placeholders})",
                 ids_limpiados,
             )
 

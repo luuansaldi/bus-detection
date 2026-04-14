@@ -633,7 +633,7 @@ class ConsensusBuffer:
 
     Events are 4-tuples: (event_type, number, direction, extra)
       provisional : (type, number, direction, cam_label)
-      confirmed   : (type, number, direction, first_crop)
+      confirmed   : (type, number, direction, crops_dict)   # {cam_label: crop}
       conflict    : (type, first_number, direction, second_number)
     """
 
@@ -645,7 +645,7 @@ class ConsensusBuffer:
         self._window_start: float | None = None
         self._reported: dict[int, float] = {}
         self._reported_dir: dict[int, str] = {}   # direction at confirmation time
-        self._first_crop = None   # crop saved at first vote for confirmed capture
+        self._crops: dict[str, any] = {}   # cam_label → crop (one per camera)
         self._lock = threading.Lock()
 
     def feed(self, result: tuple[int, str] | None, cam_label: str, crop=None) -> list[tuple]:
@@ -668,13 +668,15 @@ class ConsensusBuffer:
                         return events
                     self._window_start = now
                     self._votes = [(number, direction, cam_label)]
-                    self._first_crop = crop   # save crop at first sighting
+                    self._crops = {cam_label: crop} if crop is not None else {}
                     events.append(("provisional", number, direction, cam_label))
                     # Authoritative cameras (Cam 1/Cam 2) confirm immediately — no second vote needed
                     if cam_label in CAM_FIXED_DIRECTION:
                         events.extend(self._close(now))
             else:
-                # Window already open
+                # Window already open — store crop from this camera
+                if crop is not None and cam_label not in self._crops:
+                    self._crops[cam_label] = crop
                 if result is not None:
                     number, direction = result
                     self._votes.append((number, direction, cam_label))
@@ -728,12 +730,12 @@ class ConsensusBuffer:
             # All votes agree
             self._reported[winner] = now
             self._reported_dir[winner] = direction
-            crop = self._first_crop
-            self._first_crop = None
-            return [("confirmed", winner, direction, crop)]
+            crops = self._crops
+            self._crops = {}
+            return [("confirmed", winner, direction, crops)]
         else:
             # Conflict: return most-voted competing number as extra
-            self._first_crop = None
+            self._crops = {}
             rival = max(distinct, key=counts.__getitem__)
             return [("conflict", winner, direction, rival)]
 
@@ -1199,8 +1201,8 @@ def _handle_event(event: tuple, frame, all_states: dict) -> None:
             with s.lock:
                 s.confirmed_label = label
     elif event_type == "confirmed":
-        _, number, direction, first_crop = event
-        _report(number, direction, first_crop if first_crop is not None else frame, all_states)
+        _, number, direction, crops_dict = event
+        _report(number, direction, crops_dict if crops_dict else {}, frame, all_states)
     elif event_type == "direction_update":
         _, number, direction, _ = event
         if direction == "entering":
@@ -1222,7 +1224,7 @@ def _handle_event(event: tuple, frame, all_states: dict) -> None:
         print(f"[{ts}] ⚠️  CONFLICTO: primera lectura={first_number}, segunda lectura={rival} — descartado")
 
 
-def _report(number: int, direction: str, frame: np.ndarray, all_states: dict) -> None:
+def _report(number: int, direction: str, crops_dict: dict, fallback_frame: np.ndarray, all_states: dict) -> None:
     ts_log  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ts_file = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1240,15 +1242,31 @@ def _report(number: int, direction: str, frame: np.ndarray, all_states: dict) ->
     captures_dir = Path(__file__).resolve().parent.parent / "captures"
     captures_dir.mkdir(exist_ok=True)
     tag = f"_{direction}" if direction != "unknown" else ""
-    filename = captures_dir / f"{ts_file}_{number}{tag}.jpg"
-    cv2.imwrite(str(filename), frame)
-    db_insertar(number, direction, str(filename))
+
+    # Main image: first available crop or fallback frame
+    main_crop = next(iter(crops_dict.values()), fallback_frame) if crops_dict else fallback_frame
+    main_filename = captures_dir / f"{ts_file}_{number}{tag}.jpg"
+    cv2.imwrite(str(main_filename), main_crop)
+
+    # Save per-camera crops
+    saved_crop_paths: dict[str, str] = {}
+    for cam_label, crop in crops_dict.items():
+        if crop is None:
+            continue
+        cam_slug = cam_label.lower().replace(" ", "")
+        crop_filename = captures_dir / f"{ts_file}_{number}_{cam_slug}{tag}.jpg"
+        cv2.imwrite(str(crop_filename), crop)
+        saved_crop_paths[cam_label] = str(crop_filename)
+        print(f"  [CROP] {cam_label} → {crop_filename.name}")
+
+    db_insertar(number, direction, str(main_filename), crop_paths=saved_crop_paths)
     emit_event({
         "type": "detection",
         "timestamp": ts_log,
         "numero_flota": number,
         "direccion": direction,
-        "imagen_path": str(filename),
+        "imagen_path": str(main_filename),
+        "crops": {cam: Path(p).name for cam, p in saved_crop_paths.items()},
     })
 
     for s in all_states.values():
