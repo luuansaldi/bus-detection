@@ -295,6 +295,23 @@
     .capture-card .card-info { padding: 7px 8px; }
     .capture-card .card-time { font-size: 11px; color: #6b7280; font-variant-numeric: tabular-nums; margin-bottom: 4px; }
     .capture-card .badge { font-size: 10px; padding: 2px 7px; }
+
+    .crops-row {
+      display: flex; gap: 4px; padding: 6px 8px;
+      border-top: 1px solid #1e2330;
+      overflow-x: auto;
+    }
+    .crop-thumb {
+      flex-shrink: 0; width: 56px; text-align: center;
+    }
+    .crop-thumb img {
+      width: 56px; height: 42px;
+      object-fit: cover; border-radius: 4px;
+      cursor: pointer; display: block;
+    }
+    .crop-label {
+      font-size: 9px; color: #6b7280; margin-top: 2px; display: block;
+    }
   </style>
 </head>
 <body>
@@ -723,12 +740,25 @@
     } else {
       imgHtml = '<div class="no-img-card">📷</div>';
     }
+    // Per-camera crops
+    let cropsHtml = '';
+    if (c.crops && c.crops.length > 0) {
+      cropsHtml = '<div class="crops-row">' + c.crops.map(cr => {
+        const fn = (cr.crop_path.split('/').pop() || '').split('\\').pop();
+        const url = '/captures/' + fn;
+        return `<div class="crop-thumb">
+          <img src="${url}" loading="lazy" onclick="openLightbox('${url}')" />
+          <span class="crop-label">${cr.cam_label}</span>
+        </div>`;
+      }).join('') + '</div>';
+    }
     return `<div class="capture-card">
       ${imgHtml}
       <div class="card-info">
         <div class="card-time">${c.timestamp.slice(11,19)}</div>
         ${dirBadge(c.direccion)}
       </div>
+      ${cropsHtml}
     </div>`;
   }
 
@@ -756,7 +786,8 @@
     b.total++;
     if (msg.direccion === 'entering') b.entradas++;
     if (msg.direccion === 'exiting')  b.salidas++;
-    b.capturas.push({ timestamp: msg.timestamp, direccion: msg.direccion, imagen_path: msg.imagen_path || null });
+    const crops = msg.crops ? Object.entries(msg.crops).map(([cam, fn]) => ({cam_label: cam, crop_path: fn})) : [];
+    b.capturas.push({ timestamp: msg.timestamp, direccion: msg.direccion, imagen_path: msg.imagen_path || null, crops });
 
     const activeTab = document.querySelector('.tab-content.active');
     if (!activeTab || activeTab.id !== 'tab-porbus') return;

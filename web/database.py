@@ -34,6 +34,15 @@ def init_db() -> None:
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS detection_crops (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                detection_id  INTEGER NOT NULL,
+                cam_label     TEXT    NOT NULL,
+                crop_path     TEXT    NOT NULL,
+                FOREIGN KEY (detection_id) REFERENCES detecciones(id)
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS comparaciones (
                 id                 INTEGER PRIMARY KEY AUTOINCREMENT,
                 numero_flota       INTEGER NOT NULL,
@@ -46,15 +55,44 @@ def init_db() -> None:
         """)
 
 
-def insertar(numero_flota: int, direccion: str, imagen_path: str | None = None) -> int:
-    """Inserta una detección confirmada. Retorna el id del registro creado."""
+def insertar(numero_flota: int, direccion: str, imagen_path: str | None = None,
+             crop_paths: dict[str, str] | None = None) -> int:
+    """Inserta una detección confirmada y opcionalmente los crops por cámara. Retorna el id."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO detecciones (timestamp, numero_flota, direccion, imagen_path) VALUES (?, ?, ?, ?)",
             (ts, numero_flota, direccion, imagen_path),
         )
-        return cur.lastrowid
+        det_id = cur.lastrowid
+        if crop_paths:
+            conn.executemany(
+                "INSERT INTO detection_crops (detection_id, cam_label, crop_path) VALUES (?, ?, ?)",
+                [(det_id, cam, path) for cam, path in crop_paths.items()],
+            )
+        return det_id
+
+
+def obtener_crops(detection_id: int) -> list[dict]:
+    """Devuelve los crops por cámara de una detección."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT cam_label, crop_path FROM detection_crops WHERE detection_id = ? ORDER BY cam_label",
+            (detection_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def actualizar_direccion(numero_flota: int, direccion: str) -> bool:
+    """Actualiza la dirección de la detección más reciente de este bus (si era 'unknown')."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE detecciones SET direccion = ? "
+            "WHERE id = (SELECT id FROM detecciones WHERE numero_flota = ? "
+            "AND direccion = 'unknown' ORDER BY id DESC LIMIT 1)",
+            (direccion, numero_flota),
+        )
+        return cur.rowcount > 0
 
 
 def get_ultima_salida(numero_flota: int) -> dict | None:
@@ -152,6 +190,15 @@ def stats_por_numero() -> list[dict]:
                 WHERE numero_flota = ?
                 ORDER BY timestamp ASC
             """, (bus["numero_flota"],)).fetchall()
+            capturas_list = []
+            for c in capturas:
+                cap = dict(c)
+                crops = conn.execute(
+                    "SELECT cam_label, crop_path FROM detection_crops WHERE detection_id = ? ORDER BY cam_label",
+                    (c["id"],),
+                ).fetchall()
+                cap["crops"] = [dict(cr) for cr in crops]
+                capturas_list.append(cap)
             ultimo_analisis = conn.execute("""
                 SELECT resultado, descripcion, timestamp_analisis
                 FROM comparaciones
@@ -159,11 +206,11 @@ def stats_por_numero() -> list[dict]:
                 ORDER BY id DESC LIMIT 1
             """, (bus["numero_flota"],)).fetchone()
             result.append({
-                "numero_flota":   bus["numero_flota"],
-                "total":          bus["total"],
-                "entradas":       bus["entradas"],
-                "salidas":        bus["salidas"],
-                "capturas":       [dict(c) for c in capturas],
+                "numero_flota":    bus["numero_flota"],
+                "total":           bus["total"],
+                "entradas":        bus["entradas"],
+                "salidas":         bus["salidas"],
+                "capturas":        capturas_list,
                 "ultimo_analisis": dict(ultimo_analisis) if ultimo_analisis else None,
             })
     return result
@@ -200,11 +247,31 @@ def limpiar_capturas_antiguas(retention_days: int) -> int:
                     archivos_borrados += 1
                 except OSError:
                     pass
+            # Borrar crops asociados
+            crop_filas = conn.execute(
+                "SELECT crop_path FROM detection_crops WHERE detection_id = ?",
+                (fila["id"],),
+            ).fetchall()
+            for cf in crop_filas:
+                cp = _Path(cf["crop_path"])
+                if not cp.is_absolute():
+                    cp = captures_dir / cp.name
+                if cp.exists():
+                    try:
+                        cp.unlink()
+                        archivos_borrados += 1
+                    except OSError:
+                        pass
             ids_limpiados.append(fila["id"])
 
         if ids_limpiados:
+            placeholders = ','.join('?' * len(ids_limpiados))
             conn.execute(
-                f"UPDATE detecciones SET imagen_path = NULL WHERE id IN ({','.join('?' * len(ids_limpiados))})",
+                f"UPDATE detecciones SET imagen_path = NULL WHERE id IN ({placeholders})",
+                ids_limpiados,
+            )
+            conn.execute(
+                f"DELETE FROM detection_crops WHERE detection_id IN ({placeholders})",
                 ids_limpiados,
             )
 

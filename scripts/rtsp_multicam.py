@@ -35,7 +35,7 @@ from roi.extractor import extract_rois, extract_full_bus_crop
 from preprocessing.image_processor import process
 from ocr.reader import read_candidates
 from filters.candidate_filter import select_best
-from web.database import init_db, insertar as db_insertar, get_ultima_salida as db_get_ultima_salida
+from web.database import init_db, insertar as db_insertar, actualizar_direccion as db_actualizar_direccion, get_ultima_salida as db_get_ultima_salida
 from web.app import emit_event
 
 BASE_URL = "rtsp://test:fono1234@190.220.138.178:34224/cam/realmonitor"
@@ -131,6 +131,31 @@ ZONE_FALLBACK_AREA   = 300_000   # px² — large bus = close to camera
 ZONE_FALLBACK_MIN_DX = 20        # px  — minimum leftward movement to fire fallback
 
 
+# ── Global barrier crossing signals ───────────────────────────────────────────
+# YOLO workers write here when a bus crosses a barrier line (independent of OCR).
+# Maps cam_label → monotonic timestamp of last crossing detected.
+_barrier_crossings: dict[str, float] = {}
+_barrier_lock = threading.Lock()
+
+BARRIER_SIGNAL_MAX_AGE = 15.0  # seconds — crossing signal is valid for this long
+
+
+def record_barrier_crossing(cam_label: str) -> None:
+    with _barrier_lock:
+        _barrier_crossings[cam_label] = time.monotonic()
+
+
+def get_recent_barrier_direction(max_age: float = BARRIER_SIGNAL_MAX_AGE) -> str:
+    """Return direction from the most recent barrier crossing, or 'unknown'."""
+    now = time.monotonic()
+    with _barrier_lock:
+        for cam, direction in CAM_FIXED_DIRECTION.items():
+            ts = _barrier_crossings.get(cam, 0.0)
+            if now - ts < max_age:
+                return direction
+    return "unknown"
+
+
 # ── A: Static bus filter + direction tracker ──────────────────────────────────
 
 class MotionFilter:
@@ -202,6 +227,7 @@ class MotionFilter:
                 "zones_visited": [],          # ordered list of zones visited ("A", "B")
                 "in_zone": in_zone_now,       # bus center was seen inside trigger zone
                 "crossing_fired": False,      # zone crossing already triggered once
+                "barrier_signaled": False,   # barrier crossing signal sent to global
                 "max_area": 0,               # largest bbox area seen (for fallback)
             }
             self._next_slot += 1
@@ -607,7 +633,7 @@ class ConsensusBuffer:
 
     Events are 4-tuples: (event_type, number, direction, extra)
       provisional : (type, number, direction, cam_label)
-      confirmed   : (type, number, direction, first_crop)
+      confirmed   : (type, number, direction, crops_dict)   # {cam_label: crop}
       conflict    : (type, first_number, direction, second_number)
     """
 
@@ -618,7 +644,8 @@ class ConsensusBuffer:
         self._votes: list[tuple[int, str, str]] = []  # (number, direction, cam_label)
         self._window_start: float | None = None
         self._reported: dict[int, float] = {}
-        self._first_crop = None   # crop saved at first vote for confirmed capture
+        self._reported_dir: dict[int, str] = {}   # direction at confirmation time
+        self._crops: dict[str, any] = {}   # cam_label → crop (one per camera)
         self._lock = threading.Lock()
 
     def feed(self, result: tuple[int, str] | None, cam_label: str, crop=None) -> list[tuple]:
@@ -629,15 +656,27 @@ class ConsensusBuffer:
                 # No window open — first vote opens it and emits provisional
                 if result is not None:
                     number, direction = result
+                    # Direction upgrade: bus was just confirmed with unknown direction,
+                    # and now a direction camera reads the same number within cooldown.
+                    last_report = self._reported.get(number, 0.0)
+                    if (cam_label in CAM_FIXED_DIRECTION and
+                            direction != "unknown" and
+                            now - last_report < self.number_cooldown_sec and
+                            self._reported_dir.get(number) == "unknown"):
+                        self._reported_dir[number] = direction
+                        events.append(("direction_update", number, direction, None))
+                        return events
                     self._window_start = now
                     self._votes = [(number, direction, cam_label)]
-                    self._first_crop = crop   # save crop at first sighting
+                    self._crops = {cam_label: crop} if crop is not None else {}
                     events.append(("provisional", number, direction, cam_label))
                     # Authoritative cameras (Cam 1/Cam 2) confirm immediately — no second vote needed
                     if cam_label in CAM_FIXED_DIRECTION:
                         events.extend(self._close(now))
             else:
-                # Window already open
+                # Window already open — store crop from this camera
+                if crop is not None and cam_label not in self._crops:
+                    self._crops[cam_label] = crop
                 if result is not None:
                     number, direction = result
                     self._votes.append((number, direction, cam_label))
@@ -678,6 +717,11 @@ class ConsensusBuffer:
         dir_votes = [d for n, d, _ in votes if n == winner and d != "unknown"]
         direction = max(set(dir_votes), key=dir_votes.count) if dir_votes else "unknown"
 
+        # If no camera voted with a direction, check if a barrier crossing
+        # happened recently (bus crossed Cam 1 or Cam 2 but OCR failed there).
+        if direction == "unknown":
+            direction = get_recent_barrier_direction()
+
         last = self._reported.get(winner, 0.0)
         if now - last < self.number_cooldown_sec:
             return []
@@ -685,12 +729,13 @@ class ConsensusBuffer:
         if not distinct:
             # All votes agree
             self._reported[winner] = now
-            crop = self._first_crop
-            self._first_crop = None
-            return [("confirmed", winner, direction, crop)]
+            self._reported_dir[winner] = direction
+            crops = self._crops
+            self._crops = {}
+            return [("confirmed", winner, direction, crops)]
         else:
             # Conflict: return most-voted competing number as extra
-            self._first_crop = None
+            self._crops = {}
             rival = max(distinct, key=counts.__getitem__)
             return [("conflict", winner, direction, rival)]
 
@@ -937,6 +982,22 @@ def _yolo_detect(
                 print(f"  [{label}] SKIP: bus estático (no se movió o estacionado)")
             continue
 
+        # Record barrier crossing from YOLO worker (independent of OCR).
+        # This fires even if OCR can't read the number — allows other cameras
+        # that DO read the number to inherit the direction.
+        if zone_x_frac is not None and fw_for_motion > 0:
+            x1b, y1b, x2b, y2b = det.bbox
+            cxb = (x1b + x2b) / 2
+            sid = motion_filter._find_slot(cxb, (y1b + y2b) / 2)
+            if sid is not None:
+                slot = motion_filter._slots[sid]
+                if slot.get("in_zone") and slot["cx_last"] < fw_for_motion * zone_x_frac:
+                    if not slot.get("barrier_signaled"):
+                        slot["barrier_signaled"] = True
+                        record_barrier_crossing(label)
+                        if debug:
+                            print(f"  [{label}] BARRERA: cruce detectado → {CAM_FIXED_DIRECTION.get(label)}")
+
         moving.append(det)
 
     if not moving:
@@ -1101,8 +1162,9 @@ def _run_ocr(bus_crop, best, frame, bbox_ratio, fw, fh,
             if debug:
                 print(f"  [{label}] MOONDREAM: {number if number else 'none'} — sin cruce de zona, descartando")
             return None
-        # Crossing confirmed — assign fixed direction
+        # Crossing confirmed — assign fixed direction and record global signal
         direction = CAM_FIXED_DIRECTION[label]
+        record_barrier_crossing(label)
     else:
         # Override direction with fixed assignment if configured for this camera
         fixed_dir = CAM_FIXED_DIRECTION.get(label)
@@ -1139,15 +1201,30 @@ def _handle_event(event: tuple, frame, all_states: dict) -> None:
             with s.lock:
                 s.confirmed_label = label
     elif event_type == "confirmed":
-        _, number, direction, first_crop = event
-        _report(number, direction, first_crop if first_crop is not None else frame, all_states)
+        _, number, direction, crops_dict = event
+        _report(number, direction, crops_dict if crops_dict else {}, frame, all_states)
+    elif event_type == "direction_update":
+        _, number, direction, _ = event
+        if direction == "entering":
+            action = "Entro"
+        elif direction == "exiting":
+            action = "Salio"
+        else:
+            action = ""
+        label = f"{number} {action}".strip()
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{ts}] Bus {number} direccion actualizada → {action}")
+        db_actualizar_direccion(number, direction)
+        for s in all_states.values():
+            with s.lock:
+                s.confirmed_label = label
     elif event_type == "conflict":
         _, first_number, direction, rival = event
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{ts}] ⚠️  CONFLICTO: primera lectura={first_number}, segunda lectura={rival} — descartado")
 
 
-def _report(number: int, direction: str, frame: np.ndarray, all_states: dict) -> None:
+def _report(number: int, direction: str, crops_dict: dict, fallback_frame: np.ndarray, all_states: dict) -> None:
     ts_log  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ts_file = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1165,15 +1242,31 @@ def _report(number: int, direction: str, frame: np.ndarray, all_states: dict) ->
     captures_dir = Path(__file__).resolve().parent.parent / "captures"
     captures_dir.mkdir(exist_ok=True)
     tag = f"_{direction}" if direction != "unknown" else ""
-    filename = captures_dir / f"{ts_file}_{number}{tag}.jpg"
-    cv2.imwrite(str(filename), frame)
-    nueva_id = db_insertar(number, direction, str(filename))
+
+    # Main image: first available crop or fallback frame
+    main_crop = next(iter(crops_dict.values()), fallback_frame) if crops_dict else fallback_frame
+    main_filename = captures_dir / f"{ts_file}_{number}{tag}.jpg"
+    cv2.imwrite(str(main_filename), main_crop)
+
+    # Save per-camera crops
+    saved_crop_paths: dict[str, str] = {}
+    for cam_label, crop in crops_dict.items():
+        if crop is None:
+            continue
+        cam_slug = cam_label.lower().replace(" ", "")
+        crop_filename = captures_dir / f"{ts_file}_{number}_{cam_slug}{tag}.jpg"
+        cv2.imwrite(str(crop_filename), crop)
+        saved_crop_paths[cam_label] = str(crop_filename)
+        print(f"  [CROP] {cam_label} → {crop_filename.name}")
+
+    nueva_id = db_insertar(number, direction, str(main_filename), crop_paths=saved_crop_paths)
     emit_event({
         "type": "detection",
         "timestamp": ts_log,
         "numero_flota": number,
         "direccion": direction,
-        "imagen_path": str(filename),
+        "imagen_path": str(main_filename),
+        "crops": {cam: Path(p).name for cam, p in saved_crop_paths.items()},
     })
 
     if direction == "entering":
@@ -1183,7 +1276,7 @@ def _report(number: int, direction: str, frame: np.ndarray, all_states: dict) ->
             comparar_viaje_async(
                 numero_flota=number,
                 salida_path=ultima_salida["imagen_path"],
-                entrada_path=str(filename),
+                entrada_path=str(main_filename),
                 salida_id=ultima_salida["id"],
                 entrada_id=nueva_id,
             )

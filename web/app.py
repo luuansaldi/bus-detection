@@ -21,7 +21,7 @@ from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from web.database import init_db, obtener, stats_por_hora, stats_por_dia, stats_frecuentes, stats_por_numero, limpiar_capturas_antiguas
+from web.database import init_db, obtener, obtener_crops, stats_por_hora, stats_por_dia, stats_frecuentes, stats_por_numero, limpiar_capturas_antiguas
 from config.settings import CAPTURES_RETENTION_DAYS
 
 CAPTURES_DIR = Path(__file__).resolve().parent.parent / "captures"
@@ -149,6 +149,11 @@ def get_stats_frecuentes():
 @app.get("/api/stats/por-numero")
 def get_stats_por_numero():
     return JSONResponse(content=stats_por_numero())
+
+@app.get("/api/detecciones/{detection_id}/crops")
+def get_detection_crops(detection_id: int):
+    crops = obtener_crops(detection_id)
+    return JSONResponse(content=crops)
 
 
 @app.get("/captures/{filename}")
