@@ -14,14 +14,32 @@ YOLO_MODEL = "yolov8m.pt"
 # Values below this are usually background text, noise, or partial reads
 OCR_MIN_CONFIDENCE = 0.65
 
-# Fleet number valid range
-FLEET_MIN = 10
-FLEET_MAX = 1500
+# ── Fleet whitelist (loaded from config/internos.csv) ────────────────────────
+# Only numbers in this set are accepted. Replaces the old min/max/blacklist approach.
 
-# Numbers explicitly blacklisted — common false positives (e.g. speed limit signs)
-FLEET_BLACKLIST = {10, 13, 90}
+import csv as _csv
+from pathlib import Path as _Path
 
-# 4-digit numbers >= this value are assumed to be years — not applicable with max=1500
+def _load_whitelist() -> set[int]:
+    csv_path = _Path(__file__).resolve().parent / "internos.csv"
+    nums: set[int] = set()
+    with open(csv_path, encoding="latin-1") as f:
+        reader = _csv.DictReader(f, delimiter=";")
+        for row in reader:
+            code = row.get("\ufeffCódigo") or row.get("Código") or row.get("C\udcdcódigo") or list(row.values())[0]
+            try:
+                nums.add(int(code.strip()))
+            except (ValueError, AttributeError):
+                continue
+    return nums
+
+FLEET_WHITELIST: set[int] = _load_whitelist()
+
+# Legacy aliases kept for backward compatibility in scoring logic
+FLEET_MIN = min(FLEET_WHITELIST) if FLEET_WHITELIST else 1
+FLEET_MAX = max(FLEET_WHITELIST) if FLEET_WHITELIST else 9999
+
+# 4-digit numbers >= this value are assumed to be years (e.g. 2026 from CCTV timestamp)
 FLEET_YEAR_THRESHOLD = 2000
 
 # ── Captures cleanup ─────────────────────────────────────────────────────────

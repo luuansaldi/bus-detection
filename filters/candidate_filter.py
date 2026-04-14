@@ -9,14 +9,14 @@ Scoring rules:
   +0.20       if exactly 3 digits
   +0.10       if exactly 4 digits
   -0.30       if only 2 digits
-  discard     if outside FLEET_MIN–FLEET_MAX
+  discard     if not in FLEET_WHITELIST (loaded from config/internos.csv)
   discard     if 4 digits and >= FLEET_YEAR_THRESHOLD (e.g. 2026 from timestamp)
 """
 
 from dataclasses import dataclass
 
 from ocr.reader import RawCandidate
-from config.settings import FLEET_MIN, FLEET_MAX, FLEET_YEAR_THRESHOLD, OCR_MIN_CONFIDENCE
+from config.settings import FLEET_WHITELIST, FLEET_YEAR_THRESHOLD, OCR_MIN_CONFIDENCE
 
 
 @dataclass
@@ -48,8 +48,8 @@ def score_and_filter(candidates: list[RawCandidate]) -> list[ScoredCandidate]:
         if digits == 4 and value >= FLEET_YEAR_THRESHOLD:
             continue
 
-        # Hard reject: outside valid fleet range
-        if not (FLEET_MIN <= value <= FLEET_MAX):
+        # Hard reject: not in fleet whitelist
+        if value not in FLEET_WHITELIST:
             continue
 
         score = c.confidence
