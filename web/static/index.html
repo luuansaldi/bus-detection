@@ -307,16 +307,31 @@
       overflow-x: auto;
     }
     .crop-thumb {
-      flex-shrink: 0; width: 56px; text-align: center;
+      flex-shrink: 0; width: 56px; text-align: center; position: relative;
     }
     .crop-thumb img {
       width: 56px; height: 42px;
       object-fit: cover; border-radius: 4px;
       cursor: pointer; display: block;
     }
-    .crop-label {
-      font-size: 9px; color: #6b7280; margin-top: 2px; display: block;
+    .crop-actions {
+      display: flex; align-items: center; justify-content: center; gap: 2px; margin-top: 2px;
     }
+    .crop-label {
+      font-size: 9px; color: #6b7280;
+    }
+    .btn-crop-action {
+      background: none; border: none; cursor: pointer; padding: 0 2px;
+      font-size: 11px; line-height: 1; opacity: 0.4; transition: opacity 0.15s;
+    }
+    .btn-crop-action:hover { opacity: 1; }
+    .btn-star { color: #f59e0b; }
+    .btn-del { color: #ef4444; }
+    .btn-delete-det {
+      background: none; border: none; cursor: pointer; font-size: 13px;
+      opacity: 0.35; transition: opacity 0.15s; vertical-align: middle; padding: 0 2px;
+    }
+    .btn-delete-det:hover { opacity: 1; }
   </style>
 </head>
 <body>
@@ -763,15 +778,16 @@
   }
 
   function captureCardHtml(c) {
+    const detId = c.id;
     let imgHtml;
     if (c.imagen_path) {
       const filename = (c.imagen_path.split('/').pop() || '').split('\\').pop();
       const url = '/captures/' + filename;
       imgHtml = `<img src="${url}" loading="lazy" onclick="openLightbox('${url}')" />`;
     } else {
-      imgHtml = '<div class="no-img-card">📷</div>';
+      imgHtml = '<div class="no-img-card">sin imagen</div>';
     }
-    // Per-camera crops
+    // Per-camera crops with action buttons
     let cropsHtml = '';
     if (c.crops && c.crops.length > 0) {
       cropsHtml = '<div class="crops-row">' + c.crops.map(cr => {
@@ -779,18 +795,59 @@
         const url = '/captures/' + fn;
         return `<div class="crop-thumb">
           <img src="${url}" loading="lazy" onclick="openLightbox('${url}')" />
-          <span class="crop-label">${cr.cam_label}</span>
+          <div class="crop-actions">
+            <span class="crop-label">${cr.cam_label}</span>
+            <button class="btn-crop-action btn-star" title="Usar como principal" onclick="setMainImage(${detId},'${cr.cam_label}',this)">&#9733;</button>
+            <button class="btn-crop-action btn-del" title="Eliminar crop" onclick="deleteCrop(${detId},'${cr.cam_label}',this)">&#10005;</button>
+          </div>
         </div>`;
       }).join('') + '</div>';
     }
-    return `<div class="capture-card">
+    const deleteBtn = detId ? `<button class="btn-delete-det" title="Eliminar deteccion" onclick="deleteDetection(${detId},this)">&#128465;</button>` : '';
+    return `<div class="capture-card" id="det-card-${detId}">
       ${imgHtml}
       <div class="card-info">
-        <div class="card-time">${c.timestamp.slice(11,19)}</div>
+        <div class="card-time">${c.timestamp.slice(11,19)} ${deleteBtn}</div>
         ${dirBadge(c.direccion)}
       </div>
       ${cropsHtml}
     </div>`;
+  }
+
+  async function deleteCrop(detId, camLabel, btn) {
+    if (!confirm('Eliminar crop de ' + camLabel + '?')) return;
+    const res = await fetch('/api/detecciones/' + detId + '/crops/' + encodeURIComponent(camLabel), {method:'DELETE'});
+    if (res.ok) {
+      btn.closest('.crop-thumb').remove();
+    } else {
+      alert('Error al eliminar crop');
+    }
+  }
+
+  async function setMainImage(detId, camLabel, btn) {
+    const res = await fetch('/api/detecciones/' + detId + '/main-image/' + encodeURIComponent(camLabel), {method:'PUT'});
+    if (res.ok) {
+      // Refresh the main image in the card
+      const card = document.getElementById('det-card-' + detId);
+      if (card) {
+        const cropImg = btn.closest('.crop-thumb').querySelector('img');
+        const mainImg = card.querySelector(':scope > img');
+        if (mainImg && cropImg) mainImg.src = cropImg.src;
+      }
+    } else {
+      alert('Error al cambiar imagen principal');
+    }
+  }
+
+  async function deleteDetection(detId, btn) {
+    if (!confirm('Eliminar toda esta deteccion?')) return;
+    const res = await fetch('/api/detecciones/' + detId, {method:'DELETE'});
+    if (res.ok) {
+      const card = document.getElementById('det-card-' + detId);
+      if (card) card.remove();
+    } else {
+      alert('Error al eliminar deteccion');
+    }
   }
 
   function updateDamageBadge(numero_flota, resultado, severidad, descripcion) {

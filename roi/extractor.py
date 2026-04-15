@@ -51,6 +51,37 @@ class ROICrop:
     abs_bbox: tuple[int, int, int, int]   # absolute pixel coords of this crop
 
 
+def crop_quality_score(bbox_ratio: float, bbox_area: int) -> float:
+    """Score a crop for best-frame selection. Higher = better framed bus.
+
+    bbox_ratio: fraction of the frame occupied by the bus bbox.
+    bbox_area:  absolute pixel area of the bus bbox.
+
+    Returns 0.0–1.0.  Full-frame fallbacks (ratio ≈ 1.0) get a low but
+    non-zero score so they can still be replaced by a better crop from
+    another camera.
+    """
+    if bbox_ratio < 0.03:
+        return 0.0   # bus too far away — no useful detail
+
+    # Full-frame fallback (bus was too close, we sent the whole frame)
+    if bbox_ratio > 0.90:
+        return 0.10
+
+    # Bus too close / partially visible
+    if bbox_ratio > 0.55:
+        return 0.05
+
+    # Peak around 0.15-0.35: bus well-framed
+    ideal = 0.25
+    ratio_score = max(0.0, 1.0 - abs(bbox_ratio - ideal) / ideal)
+
+    # Minor bonus for higher resolution crops
+    area_score = min(bbox_area / 200_000, 1.0)
+
+    return ratio_score * 0.7 + area_score * 0.3
+
+
 def extract_full_bus_crop(
     frame: np.ndarray,
     detection: BusDetection,
@@ -63,14 +94,21 @@ def extract_full_bus_crop(
     and can locate the number anywhere in the bus image.
     """
     x1, y1, x2, y2 = detection.bbox
-    # Add horizontal padding so edge digits aren't clipped by the YOLO bbox.
-    pad_x = int((x2 - x1) * 0.08)
+    # Generous padding so the bus is fully visible with surrounding context.
+    pad_x = int((x2 - x1) * 0.25)
+    pad_y = int((y2 - y1) * 0.15)
     x1 = max(0, x1 - pad_x)
     x2 = min(detection.frame_width, x2 + pad_x)
+    y1 = max(0, y1 - pad_y)
+    y2 = min(detection.frame_height, y2 + pad_y)
     x1 = max(0, min(x1, detection.frame_width - 1))
     y1 = max(0, min(y1, detection.frame_height - 1))
     x2 = max(0, min(x2, detection.frame_width))
     y2 = max(0, min(y2, detection.frame_height))
+
+    # Avoid the DVR timestamp overlay in the top 2% of the frame.
+    timestamp_h = int(frame.shape[0] * 0.02)
+    y1 = max(y1, timestamp_h)
 
     if (x2 - x1) < min_px or (y2 - y1) < min_px:
         return None

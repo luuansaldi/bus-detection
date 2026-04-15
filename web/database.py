@@ -61,11 +61,84 @@ def init_db() -> None:
             pass
 
 
+_DEDUP_WINDOW_SEC = 60  # same bus within this window → merge into one record
+
+
 def insertar(numero_flota: int, direccion: str, imagen_path: str | None = None,
-             crop_paths: dict[str, str] | None = None) -> int:
-    """Inserta una detección confirmada y opcionalmente los crops por cámara. Retorna el id."""
+             crop_paths: dict[str, str] | None = None) -> tuple[int, bool]:
+    """Insert or merge a confirmed detection.
+
+    If the same bus (numero_flota) was already recorded within the last
+    DEDUP_WINDOW_SEC seconds, the new crops are added to the existing
+    record instead of creating a duplicate row.  The main image is
+    upgraded if the new one comes from a camera with a better angle.
+    Returns (detection_id, is_new).
+    """
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cutoff = (datetime.now() - timedelta(seconds=_DEDUP_WINDOW_SEC)).strftime("%Y-%m-%d %H:%M:%S")
+
     with get_conn() as conn:
+        # Look for a recent detection of the same bus
+        existing = conn.execute(
+            """SELECT id, direccion, imagen_path FROM detecciones
+               WHERE numero_flota = ? AND timestamp >= ?
+               ORDER BY id DESC LIMIT 1""",
+            (numero_flota, cutoff),
+        ).fetchone()
+
+        if existing is not None:
+            det_id = existing["id"]
+
+            # Upgrade direction if the existing one was unknown
+            if existing["direccion"] == "unknown" and direccion != "unknown":
+                conn.execute(
+                    "UPDATE detecciones SET direccion = ? WHERE id = ?",
+                    (direccion, det_id),
+                )
+
+            # Update timestamp to latest sighting
+            conn.execute(
+                "UPDATE detecciones SET timestamp = ? WHERE id = ?",
+                (ts, det_id),
+            )
+
+            # Add new crops that we don't already have for this detection
+            if crop_paths:
+                existing_cams = {
+                    r["cam_label"]
+                    for r in conn.execute(
+                        "SELECT cam_label FROM detection_crops WHERE detection_id = ?",
+                        (det_id,),
+                    ).fetchall()
+                }
+                new_crops = [
+                    (det_id, cam, path)
+                    for cam, path in crop_paths.items()
+                    if cam not in existing_cams
+                ]
+                if new_crops:
+                    conn.executemany(
+                        "INSERT INTO detection_crops (detection_id, cam_label, crop_path) VALUES (?, ?, ?)",
+                        new_crops,
+                    )
+
+            # Upgrade main image if new one is better (prefer non-cam1 crops)
+            if imagen_path and existing["imagen_path"]:
+                old_name = Path(existing["imagen_path"]).name
+                new_name = Path(imagen_path).name
+                # Prefer cam3/cam4 over cam1 (cenital), prefer any cam crop over generic
+                cam_priority = {"cam3": 3, "cam4": 3, "cam2": 2, "cam1": 1}
+                old_score = max((v for k, v in cam_priority.items() if k in old_name), default=0)
+                new_score = max((v for k, v in cam_priority.items() if k in new_name), default=0)
+                if new_score > old_score:
+                    conn.execute(
+                        "UPDATE detecciones SET imagen_path = ? WHERE id = ?",
+                        (imagen_path, det_id),
+                    )
+
+            return det_id, False
+
+        # No recent duplicate — insert new row
         cur = conn.execute(
             "INSERT INTO detecciones (timestamp, numero_flota, direccion, imagen_path) VALUES (?, ?, ?, ?)",
             (ts, numero_flota, direccion, imagen_path),
@@ -76,7 +149,7 @@ def insertar(numero_flota: int, direccion: str, imagen_path: str | None = None,
                 "INSERT INTO detection_crops (detection_id, cam_label, crop_path) VALUES (?, ?, ?)",
                 [(det_id, cam, path) for cam, path in crop_paths.items()],
             )
-        return det_id
+        return det_id, True
 
 
 def obtener_crops(detection_id: int) -> list[dict]:
@@ -311,3 +384,69 @@ def obtener(limit: int = 100, offset: int = 0) -> list[dict]:
             (limit, offset),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def eliminar_crop(detection_id: int, cam_label: str) -> str | None:
+    """Delete a single crop from a detection. Returns the deleted file path, or None."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT crop_path FROM detection_crops WHERE detection_id = ? AND cam_label = ?",
+            (detection_id, cam_label),
+        ).fetchone()
+        if not row:
+            return None
+        path = row["crop_path"]
+        conn.execute(
+            "DELETE FROM detection_crops WHERE detection_id = ? AND cam_label = ?",
+            (detection_id, cam_label),
+        )
+        # If the main image was this crop, reassign to another crop
+        det = conn.execute("SELECT imagen_path FROM detecciones WHERE id = ?", (detection_id,)).fetchone()
+        if det and det["imagen_path"] == path:
+            other = conn.execute(
+                "SELECT crop_path FROM detection_crops WHERE detection_id = ? LIMIT 1",
+                (detection_id,),
+            ).fetchone()
+            conn.execute(
+                "UPDATE detecciones SET imagen_path = ? WHERE id = ?",
+                (other["crop_path"] if other else None, detection_id),
+            )
+    return path
+
+
+def set_main_image(detection_id: int, cam_label: str) -> bool:
+    """Set a crop as the main image for a detection."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT crop_path FROM detection_crops WHERE detection_id = ? AND cam_label = ?",
+            (detection_id, cam_label),
+        ).fetchone()
+        if not row:
+            return False
+        conn.execute(
+            "UPDATE detecciones SET imagen_path = ? WHERE id = ?",
+            (row["crop_path"], detection_id),
+        )
+    return True
+
+
+def eliminar_deteccion(detection_id: int) -> list[str]:
+    """Delete a detection and all its crops. Returns list of file paths deleted."""
+    paths = []
+    with get_conn() as conn:
+        det = conn.execute("SELECT imagen_path FROM detecciones WHERE id = ?", (detection_id,)).fetchone()
+        if not det:
+            return paths
+        if det["imagen_path"]:
+            paths.append(det["imagen_path"])
+        crops = conn.execute(
+            "SELECT crop_path FROM detection_crops WHERE detection_id = ?", (detection_id,),
+        ).fetchall()
+        for c in crops:
+            if c["crop_path"] not in paths:
+                paths.append(c["crop_path"])
+        conn.execute("DELETE FROM detection_crops WHERE detection_id = ?", (detection_id,))
+        conn.execute("DELETE FROM comparaciones WHERE salida_id = ? OR entrada_id = ?",
+                     (detection_id, detection_id))
+        conn.execute("DELETE FROM detecciones WHERE id = ?", (detection_id,))
+    return paths
