@@ -38,7 +38,7 @@ from filters.candidate_filter import select_best
 from web.database import init_db, insertar as db_insertar, actualizar_direccion as db_actualizar_direccion, get_ultima_salida as db_get_ultima_salida
 from web.app import emit_event
 
-BASE_URL = "rtsp://test:fono1234@190.220.138.178:34224/cam/realmonitor"
+BASE_URL = "rtsp://test:fono1234@192.168.1.63:34224/cam/realmonitor"
 RECONNECT_DELAY = 5
 
 CAMERAS = {
@@ -646,9 +646,11 @@ class ConsensusBuffer:
         self._reported: dict[int, float] = {}
         self._reported_dir: dict[int, str] = {}   # direction at confirmation time
         self._crops: dict[str, any] = {}   # cam_label → crop (one per camera)
+        self._crop_scores: dict[str, float] = {}  # cam_label → quality score
         self._lock = threading.Lock()
 
-    def feed(self, result: tuple[int, str] | None, cam_label: str, crop=None) -> list[tuple]:
+    def feed(self, result: tuple[int, str] | None, cam_label: str, crop=None,
+             bbox_ratio: float = 0.0, bbox_area: int = 0) -> list[tuple]:
         now = time.monotonic()
         events: list[tuple] = []
         with self._lock:
@@ -668,15 +670,26 @@ class ConsensusBuffer:
                         return events
                     self._window_start = now
                     self._votes = [(number, direction, cam_label)]
-                    self._crops = {cam_label: crop} if crop is not None else {}
+                    if crop is not None:
+                        from roi.extractor import crop_quality_score
+                        score = crop_quality_score(bbox_ratio, bbox_area)
+                        self._crops = {cam_label: crop}
+                        self._crop_scores = {cam_label: score}
+                    else:
+                        self._crops = {}
+                        self._crop_scores = {}
                     events.append(("provisional", number, direction, cam_label))
                     # Authoritative cameras (Cam 1/Cam 2) confirm immediately — no second vote needed
                     if cam_label in CAM_FIXED_DIRECTION:
                         events.extend(self._close(now))
             else:
-                # Window already open — store crop from this camera
-                if crop is not None and cam_label not in self._crops:
-                    self._crops[cam_label] = crop
+                # Window already open — store crop if it's better than what we have
+                if crop is not None:
+                    from roi.extractor import crop_quality_score
+                    score = crop_quality_score(bbox_ratio, bbox_area)
+                    if score > self._crop_scores.get(cam_label, -1.0):
+                        self._crops[cam_label] = crop
+                        self._crop_scores[cam_label] = score
                 if result is not None:
                     number, direction = result
                     self._votes.append((number, direction, cam_label))
@@ -732,10 +745,12 @@ class ConsensusBuffer:
             self._reported_dir[winner] = direction
             crops = self._crops
             self._crops = {}
+            self._crop_scores = {}
             return [("confirmed", winner, direction, crops)]
         else:
             # Conflict: return most-voted competing number as extra
             self._crops = {}
+            self._crop_scores = {}
             rival = max(distinct, key=counts.__getitem__)
             return [("conflict", winner, direction, rival)]
 
@@ -1048,7 +1063,21 @@ def ocr_worker(
                 print(f"  [{label}] OCR ERROR: {e}")
                 raw = None
 
-            events = global_buffer.feed(raw, label, crop=bus_crop)
+            # When the bus fills most of the frame (bbox_ratio > 0.40),
+            # the crop is likely a partial/zoomed view. Use the full frame instead,
+            # which shows the complete bus with context.
+            x1, y1, x2, y2 = best.bbox
+            bbox_area = (x2 - x1) * (y2 - y1)
+            if bbox_ratio > 0.40:
+                capture_crop = frame.copy()
+                capture_ratio = 1.0
+                capture_area = frame.shape[0] * frame.shape[1]
+            else:
+                capture_crop = bus_crop
+                capture_ratio = bbox_ratio
+                capture_area = bbox_area
+            events = global_buffer.feed(raw, label, crop=capture_crop,
+                                        bbox_ratio=capture_ratio, bbox_area=capture_area)
 
             if debug and raw is not None:
                 votes = global_buffer.all_votes()
@@ -1259,7 +1288,10 @@ def _report(number: int, direction: str, crops_dict: dict, fallback_frame: np.nd
         saved_crop_paths[cam_label] = str(crop_filename)
         print(f"  [CROP] {cam_label} → {crop_filename.name}")
 
-    nueva_id = db_insertar(number, direction, str(main_filename), crop_paths=saved_crop_paths)
+    nueva_id, is_new = db_insertar(number, direction, str(main_filename), crop_paths=saved_crop_paths)
+    if not is_new:
+        print(f"  [MERGE] Agregado a detección existente id={nueva_id}")
+
     emit_event({
         "type": "detection",
         "timestamp": ts_log,
@@ -1269,7 +1301,8 @@ def _report(number: int, direction: str, crops_dict: dict, fallback_frame: np.nd
         "crops": {cam: Path(p).name for cam, p in saved_crop_paths.items()},
     })
 
-    if direction == "entering":
+    # Only trigger damage comparison on the first detection (not merges)
+    if is_new and direction == "entering":
         ultima_salida = db_get_ultima_salida(number)
         if ultima_salida and ultima_salida.get("imagen_path"):
             from web.damage_detector import comparar_viaje_async

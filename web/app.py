@@ -23,7 +23,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from web.database import (init_db, obtener, obtener_crops, stats_por_hora, stats_por_dia,
                            stats_frecuentes, stats_por_numero, limpiar_capturas_antiguas,
-                           get_comparacion, get_deteccion_by_id)
+                           get_comparacion, get_deteccion_by_id,
+                           eliminar_crop, set_main_image, eliminar_deteccion)
 from config.settings import CAPTURES_RETENTION_DAYS
 
 CAPTURES_DIR = Path(__file__).resolve().parent.parent / "captures"
@@ -34,7 +35,7 @@ app = FastAPI(title="Fonobus API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE", "PUT"],
     allow_headers=["*"],
 )
 
@@ -176,6 +177,37 @@ def reintentar_comparacion(comp_id: int):
         comp["salida_id"], comp["entrada_id"],
     )
     return JSONResponse(content={"status": "reintentando"})
+
+
+@app.delete("/api/detecciones/{detection_id}")
+def delete_detection(detection_id: int):
+    paths = eliminar_deteccion(detection_id)
+    import os
+    for p in paths:
+        if p and os.path.exists(p):
+            os.unlink(p)
+    if not paths and not get_deteccion_by_id(detection_id):
+        raise HTTPException(status_code=404, detail="Detección no encontrada")
+    return JSONResponse(content={"deleted": len(paths)})
+
+
+@app.delete("/api/detecciones/{detection_id}/crops/{cam_label}")
+def delete_crop(detection_id: int, cam_label: str):
+    import os
+    path = eliminar_crop(detection_id, cam_label)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Crop no encontrado")
+    if os.path.exists(path):
+        os.unlink(path)
+    return JSONResponse(content={"deleted": path})
+
+
+@app.put("/api/detecciones/{detection_id}/main-image/{cam_label}")
+def update_main_image(detection_id: int, cam_label: str):
+    ok = set_main_image(detection_id, cam_label)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Crop no encontrado")
+    return JSONResponse(content={"status": "ok"})
 
 
 @app.get("/captures/{filename}")
