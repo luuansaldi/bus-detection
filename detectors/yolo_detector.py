@@ -61,20 +61,25 @@ class BusDetector:
         self._model.to(self._device)
         self._lock = threading.Lock()
 
-    def detect(self, image: np.ndarray) -> list[BusDetection]:
+    def detect(self, image: np.ndarray, conf: float | None = None) -> list[BusDetection]:
         """
         Run detection on a single BGR image (as returned by cv2.imread).
+
+        Args:
+            image: BGR frame.
+            conf:  Override min confidence for this call (e.g., night mode).
 
         Returns a list of BusDetection, one per bus found.
         Results are sorted by confidence descending.
         """
         frame_h, frame_w = image.shape[:2]
+        threshold = self.min_confidence if conf is None else conf
 
         with self._lock:
             results = self._model(
                 image,
                 classes=self.class_ids,
-                conf=self.min_confidence,
+                conf=threshold,
                 verbose=False,
                 device=self._device,
             )

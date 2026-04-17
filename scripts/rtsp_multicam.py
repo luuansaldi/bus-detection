@@ -31,11 +31,13 @@ import cv2
 import numpy as np
 
 from detectors.yolo_detector import BusDetector, BusDetection
-from roi.extractor import extract_rois, extract_full_bus_crop
+from roi.extractor import extract_rois, extract_full_bus_crop, prepare_capture_frame
 from preprocessing.image_processor import process
+from preprocessing.night_enhancer import enhance as night_enhance, is_dark_frame
+from config.settings import YOLO_MIN_CONFIDENCE_NIGHT
 from ocr.reader import read_candidates
 from filters.candidate_filter import select_best
-from web.database import init_db, insertar as db_insertar, actualizar_direccion as db_actualizar_direccion, get_ultima_salida as db_get_ultima_salida
+from web.database import init_db, insertar as db_insertar, actualizar_direccion as db_actualizar_direccion
 from web.app import emit_event
 
 BASE_URL = "rtsp://test:fono1234@192.168.1.63:34224/cam/realmonitor"
@@ -671,8 +673,8 @@ class ConsensusBuffer:
                     self._window_start = now
                     self._votes = [(number, direction, cam_label)]
                     if crop is not None:
-                        from roi.extractor import crop_quality_score
-                        score = crop_quality_score(bbox_ratio, bbox_area)
+                        from preprocessing.night_enhancer import sharpness
+                        score = sharpness(crop)
                         self._crops = {cam_label: crop}
                         self._crop_scores = {cam_label: score}
                     else:
@@ -683,10 +685,10 @@ class ConsensusBuffer:
                     if cam_label in CAM_FIXED_DIRECTION:
                         events.extend(self._close(now))
             else:
-                # Window already open — store crop if it's better than what we have
+                # Window already open — store crop if it's sharper than what we have
                 if crop is not None:
-                    from roi.extractor import crop_quality_score
-                    score = crop_quality_score(bbox_ratio, bbox_area)
+                    from preprocessing.night_enhancer import sharpness
+                    score = sharpness(crop)
                     if score > self._crop_scores.get(cam_label, -1.0):
                         self._crops[cam_label] = crop
                         self._crop_scores[cam_label] = score
@@ -951,7 +953,12 @@ def _yolo_detect(
     """
     from roi.extractor import extract_full_bus_crop
 
-    detections = detector.detect(frame)
+    if is_dark_frame(frame):
+        detections = detector.detect(night_enhance(frame), conf=YOLO_MIN_CONFIDENCE_NIGHT)
+        if debug and detections:
+            print(f"  [{label}] NIGHT MODE: enhance + conf={YOLO_MIN_CONFIDENCE_NIGHT}")
+    else:
+        detections = detector.detect(frame)
     if not detections:
         if debug:
             print(f"  [{label}] YOLO: sin bus")
@@ -1063,21 +1070,14 @@ def ocr_worker(
                 print(f"  [{label}] OCR ERROR: {e}")
                 raw = None
 
-            # When the bus fills most of the frame (bbox_ratio > 0.40),
-            # the crop is likely a partial/zoomed view. Use the full frame instead,
-            # which shows the complete bus with context.
-            x1, y1, x2, y2 = best.bbox
-            bbox_area = (x2 - x1) * (y2 - y1)
-            if bbox_ratio > 0.40:
-                capture_crop = frame.copy()
-                capture_ratio = 1.0
-                capture_area = frame.shape[0] * frame.shape[1]
-            else:
-                capture_crop = bus_crop
-                capture_ratio = bbox_ratio
-                capture_area = bbox_area
+            # Save the FULL camera frame (timestamp removed, night-enhanced if
+            # dark) for later AI damage analysis. Each camera contributes its
+            # complete view so laterales, frente y cola del bus quedan visibles
+            # en el set guardado.
+            capture_crop = prepare_capture_frame(frame)
+            capture_area = capture_crop.shape[0] * capture_crop.shape[1]
             events = global_buffer.feed(raw, label, crop=capture_crop,
-                                        bbox_ratio=capture_ratio, bbox_area=capture_area)
+                                        bbox_ratio=1.0, bbox_area=capture_area)
 
             if debug and raw is not None:
                 votes = global_buffer.all_votes()
@@ -1294,6 +1294,7 @@ def _report(number: int, direction: str, crops_dict: dict, fallback_frame: np.nd
 
     emit_event({
         "type": "detection",
+        "id": nueva_id,
         "timestamp": ts_log,
         "numero_flota": number,
         "direccion": direction,
@@ -1301,18 +1302,16 @@ def _report(number: int, direction: str, crops_dict: dict, fallback_frame: np.nd
         "crops": {cam: Path(p).name for cam, p in saved_crop_paths.items()},
     })
 
-    # Only trigger damage comparison on the first detection (not merges)
-    if is_new and direction == "entering":
-        ultima_salida = db_get_ultima_salida(number)
-        if ultima_salida and ultima_salida.get("imagen_path"):
-            from web.damage_detector import comparar_viaje_async
-            comparar_viaje_async(
-                numero_flota=number,
-                salida_path=ultima_salida["imagen_path"],
-                entrada_path=str(main_filename),
-                salida_id=ultima_salida["id"],
-                entrada_id=nueva_id,
-            )
+    # Every new detection triggers an individual Gemini analysis. When both
+    # legs of a round trip have analyses, the module fires the text comparison.
+    if is_new:
+        from web.damage_detector import analizar_individual_async
+        analizar_individual_async(
+            detection_id=nueva_id,
+            numero_flota=number,
+            direccion=direction,
+            fallback_path=str(main_filename),
+        )
 
     for s in all_states.values():
         with s.lock:

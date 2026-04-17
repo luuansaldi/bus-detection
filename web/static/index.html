@@ -167,6 +167,25 @@
       max-width: 240px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
 
+    .ind-analisis {
+      margin-top: 6px;
+      padding: 6px 8px;
+      border-radius: 6px;
+      font-size: 11px;
+      border: 1px solid #1e2330;
+      background: #0d0f14;
+    }
+    .ind-analisis.ok      { border-color: #166534; background: #062013; }
+    .ind-analisis.danado  { border-color: #7f1d1d; background: #2d0f0f; }
+    .ind-analisis.inconcluye { border-color: #374151; background: #1a1f2e; }
+    .ind-analisis.error   { border-color: #78350f; background: #1c1917; }
+    .ind-analisis.pendiente { border-style: dashed; }
+    .ind-header { display: flex; gap: 4px; align-items: center; font-weight: 600; margin-bottom: 4px; }
+    .ind-icon { font-size: 13px; }
+    .ind-label { color: #94a3b8; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .ind-body { margin: 0; padding: 0; font-family: inherit; font-size: 11px; color: #cbd5e1; white-space: pre-wrap; word-break: break-word; line-height: 1.4; }
+    .ind-spinner { color: #6b7280; font-style: italic; }
+
     .ts { color: #6b7280; font-size: 13px; font-variant-numeric: tabular-nums; }
 
     .thumb-wrap {
@@ -598,6 +617,21 @@
           };
         }
       }
+
+      if (msg.type === 'individual_analysis') {
+        const bus = busRegistry[msg.numero_flota];
+        if (bus) {
+          const capt = bus.capturas.find(c => c.id === msg.detection_id);
+          if (capt) {
+            capt.analisis_individual = msg.analisis;
+            capt.analisis_estado = msg.estado;
+          }
+        }
+        const box = document.getElementById('ind-analisis-' + msg.detection_id);
+        if (box) {
+          box.outerHTML = individualAnalisisHtml(msg.detection_id, msg.estado, msg.analisis);
+        }
+      }
     };
 
     ws.onclose = () => {
@@ -804,6 +838,7 @@
       }).join('') + '</div>';
     }
     const deleteBtn = detId ? `<button class="btn-delete-det" title="Eliminar deteccion" onclick="deleteDetection(${detId},this)">&#128465;</button>` : '';
+    const analisisHtml = individualAnalisisHtml(detId, c.analisis_estado, c.analisis_individual);
     return `<div class="capture-card" id="det-card-${detId}">
       ${imgHtml}
       <div class="card-info">
@@ -811,6 +846,26 @@
         ${dirBadge(c.direccion)}
       </div>
       ${cropsHtml}
+      ${analisisHtml}
+    </div>`;
+  }
+
+  function individualAnalisisHtml(detId, estado, texto) {
+    if (!detId) return '';
+    if (!texto) {
+      return `<div class="ind-analisis pendiente" id="ind-analisis-${detId}">
+        <span class="ind-label">Análisis:</span> <span class="ind-spinner">analizando…</span>
+      </div>`;
+    }
+    let cls = 'inconcluye';
+    let icon = '?';
+    if (estado === 'ok') { cls = 'ok'; icon = '✓'; }
+    else if (estado === 'danado') { cls = 'danado'; icon = '⚠'; }
+    else if (estado === 'error') { cls = 'error'; icon = '!'; }
+    const pre = texto.replace(/</g,'&lt;');
+    return `<div class="ind-analisis ${cls}" id="ind-analisis-${detId}">
+      <div class="ind-header"><span class="ind-icon">${icon}</span><span class="ind-label">Análisis individual</span></div>
+      <pre class="ind-body">${pre}</pre>
     </div>`;
   }
 
@@ -876,7 +931,15 @@
     if (msg.direccion === 'entering') b.entradas++;
     if (msg.direccion === 'exiting')  b.salidas++;
     const crops = msg.crops ? Object.entries(msg.crops).map(([cam, fn]) => ({cam_label: cam, crop_path: fn})) : [];
-    b.capturas.push({ timestamp: msg.timestamp, direccion: msg.direccion, imagen_path: msg.imagen_path || null, crops });
+    b.capturas.push({
+      id: msg.id || null,
+      timestamp: msg.timestamp,
+      direccion: msg.direccion,
+      imagen_path: msg.imagen_path || null,
+      crops,
+      analisis_individual: null,
+      analisis_estado: null,
+    });
 
     const activeTab = document.querySelector('.tab-content.active');
     if (!activeTab || activeTab.id !== 'tab-porbus') return;

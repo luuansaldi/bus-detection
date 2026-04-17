@@ -59,3 +59,27 @@ CLAUDE_MIN_INTERVAL_SEC = 1.5
 
 # Max tokens for the OCR response (answer is at most 4 digits or "none")
 CLAUDE_MAX_TOKENS = 16
+
+# ── Crop padding (fed to Gemini / Moondream) ────────────────────────────────
+# Padding alrededor del bbox de YOLO antes de mandar a la IA. Generoso para que
+# el bus completo (espejos, paragolpes, parte trasera) entre en el crop aun si
+# el bbox de YOLO quedó apretado.
+CROP_PAD_X_FRAC = 0.40
+CROP_PAD_Y_FRAC = 0.25
+CROP_MIN_PAD_PX = 40
+
+# Píxeles a cortar en el borde superior para tapar el timestamp del DVR (que
+# Moondream/Gemini leen como número y confunden con el interno del bus).
+# Aplicado tanto a `extract_full_bus_crop` como a frames completos guardados
+# para análisis de daños.
+CAPTURE_TIMESTAMP_TOP_PX = 60
+
+# ── Night-mode preprocessing ────────────────────────────────────────────────
+# Brillo medio (0-255) por debajo del cual el frame se considera "noche" y se
+# aplica CLAHE + gamma antes de YOLO y a los crops para Gemini/Moondream.
+NIGHT_BRIGHTNESS_THRESHOLD = 70.0
+# Gamma >1 levanta sombras; rango seguro 1.4–1.8.
+NIGHT_GAMMA = 1.6
+# Threshold de YOLO reducido en noche: el contraste enhancado puede generar
+# bbox ligeramente menos confiables y conviene ser más permisivo.
+YOLO_MIN_CONFIDENCE_NIGHT = 0.30
