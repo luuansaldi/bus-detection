@@ -59,6 +59,17 @@ def init_db() -> None:
             conn.execute("ALTER TABLE comparaciones ADD COLUMN severidad TEXT DEFAULT 'desconocida'")
         except Exception:
             pass
+        # Migración: análisis individual por detección (estado visible del bus).
+        # Se guarda apenas se captura; se usa después para comparar sin volver a
+        # cargar las imágenes.
+        try:
+            conn.execute("ALTER TABLE detecciones ADD COLUMN analisis_individual TEXT")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE detecciones ADD COLUMN analisis_estado TEXT")  # ok / danado / inconcluye / error / pendiente
+        except Exception:
+            pass
 
 
 _DEDUP_WINDOW_SEC = 60  # same bus within this window → merge into one record
@@ -160,6 +171,58 @@ def obtener_crops(detection_id: int) -> list[dict]:
             (detection_id,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def actualizar_analisis_individual(detection_id: int, analisis: str, estado: str) -> None:
+    """Guarda el texto del análisis individual de una detección."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE detecciones SET analisis_individual = ?, analisis_estado = ? WHERE id = ?",
+            (analisis, estado, detection_id),
+        )
+
+
+def get_ultima_salida_con_analisis(numero_flota: int) -> dict | None:
+    """
+    Retorna la última detección 'exiting' del bus que YA tiene análisis individual
+    y todavía no fue comparada contra una entrada. None si no existe.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT d.id, d.timestamp, d.imagen_path, d.analisis_individual
+               FROM detecciones d
+               WHERE d.numero_flota = ?
+                 AND d.direccion = 'exiting'
+                 AND d.analisis_individual IS NOT NULL
+                 AND NOT EXISTS (
+                     SELECT 1 FROM comparaciones c WHERE c.salida_id = d.id
+                 )
+               ORDER BY d.timestamp DESC LIMIT 1""",
+            (numero_flota,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_deteccion_entrada_pendiente(numero_flota: int, desde_ts: str) -> dict | None:
+    """
+    Retorna la primera detección 'entering' con análisis individual posterior a
+    desde_ts que aún no tiene comparación registrada. None si no existe.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT d.id, d.timestamp, d.imagen_path, d.analisis_individual
+               FROM detecciones d
+               WHERE d.numero_flota = ?
+                 AND d.direccion = 'entering'
+                 AND d.timestamp > ?
+                 AND d.analisis_individual IS NOT NULL
+                 AND NOT EXISTS (
+                     SELECT 1 FROM comparaciones c WHERE c.entrada_id = d.id
+                 )
+               ORDER BY d.timestamp ASC LIMIT 1""",
+            (numero_flota, desde_ts),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def actualizar_direccion(numero_flota: int, direccion: str) -> bool:
@@ -283,7 +346,8 @@ def stats_por_numero() -> list[dict]:
         result = []
         for bus in buses:
             capturas = conn.execute("""
-                SELECT id, timestamp, direccion, imagen_path
+                SELECT id, timestamp, direccion, imagen_path,
+                       analisis_individual, analisis_estado
                 FROM detecciones
                 WHERE numero_flota = ?
                 ORDER BY timestamp ASC

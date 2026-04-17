@@ -19,7 +19,14 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from config.settings import (
+    CROP_PAD_X_FRAC,
+    CROP_PAD_Y_FRAC,
+    CROP_MIN_PAD_PX,
+    CAPTURE_TIMESTAMP_TOP_PX,
+)
 from detectors.yolo_detector import BusDetection
+from preprocessing.night_enhancer import enhance, is_dark_frame
 
 
 # ---------------------------------------------------------------------------
@@ -94,9 +101,8 @@ def extract_full_bus_crop(
     and can locate the number anywhere in the bus image.
     """
     x1, y1, x2, y2 = detection.bbox
-    # Generous padding so the bus is fully visible with surrounding context.
-    pad_x = int((x2 - x1) * 0.25)
-    pad_y = int((y2 - y1) * 0.15)
+    pad_x = max(CROP_MIN_PAD_PX, int((x2 - x1) * CROP_PAD_X_FRAC))
+    pad_y = max(CROP_MIN_PAD_PX, int((y2 - y1) * CROP_PAD_Y_FRAC))
     x1 = max(0, x1 - pad_x)
     x2 = min(detection.frame_width, x2 + pad_x)
     y1 = max(0, y1 - pad_y)
@@ -106,14 +112,32 @@ def extract_full_bus_crop(
     x2 = max(0, min(x2, detection.frame_width))
     y2 = max(0, min(y2, detection.frame_height))
 
-    # Avoid the DVR timestamp overlay in the top 2% of the frame.
-    timestamp_h = int(frame.shape[0] * 0.02)
-    y1 = max(y1, timestamp_h)
+    # Avoid the DVR timestamp overlay at the top of the frame.
+    y1 = max(y1, CAPTURE_TIMESTAMP_TOP_PX)
 
     if (x2 - x1) < min_px or (y2 - y1) < min_px:
         return None
 
-    return frame[y1:y2, x1:x2].copy()
+    crop = frame[y1:y2, x1:x2].copy()
+    if is_dark_frame(frame):
+        crop = enhance(crop)
+    return crop
+
+
+def prepare_capture_frame(frame: np.ndarray) -> np.ndarray:
+    """
+    Devuelve el frame completo listo para guardar como captura para análisis
+    de daños: borra la franja superior con timestamp del DVR y aplica
+    night-enhance si el frame está oscuro.
+    """
+    if frame is None or frame.size == 0:
+        return frame
+    h = frame.shape[0]
+    top = min(CAPTURE_TIMESTAMP_TOP_PX, max(0, h // 4))
+    out = frame[top:].copy()
+    if is_dark_frame(out):
+        out = enhance(out)
+    return out
 
 
 def extract_rois(
