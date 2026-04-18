@@ -340,7 +340,7 @@ def stats_por_numero() -> list[dict]:
                    SUM(CASE WHEN direccion='exiting'  THEN 1 ELSE 0 END) AS salidas
             FROM detecciones
             GROUP BY numero_flota
-            ORDER BY total DESC
+            ORDER BY numero_flota ASC
         """).fetchall()
 
         result = []

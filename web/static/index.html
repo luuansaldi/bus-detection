@@ -750,7 +750,7 @@
 
   function renderPorBus() {
     const tbody = document.getElementById('bus-tbody');
-    const buses = Object.values(busRegistry).sort((a, b) => b.total - a.total);
+    const buses = Object.values(busRegistry).sort((a, b) => a.numero_flota - b.numero_flota);
     if (!buses.length) {
       tbody.innerHTML = '<tr><td colspan="6"><div class="empty-state"><div class="icon">🚌</div><p>Sin detecciones aún</p></div></td></tr>';
       return;

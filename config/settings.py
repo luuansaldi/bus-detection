@@ -71,8 +71,12 @@ CROP_MIN_PAD_PX = 40
 # Píxeles a cortar en el borde superior para tapar el timestamp del DVR (que
 # Moondream/Gemini leen como número y confunden con el interno del bus).
 # Aplicado tanto a `extract_full_bus_crop` como a frames completos guardados
-# para análisis de daños.
+# para análisis de daños. Actúa como piso mínimo — el alto efectivo escala
+# con la altura del frame vía CAPTURE_TIMESTAMP_TOP_FRAC.
 CAPTURE_TIMESTAMP_TOP_PX = 60
+# En el stream real 1440×1616 el timestamp del DVR llega hasta y≈85.
+# 0.075 × 1616 = 121 px, deja ~35 px de margen.
+CAPTURE_TIMESTAMP_TOP_FRAC = 0.075
 
 # ── Night-mode preprocessing ────────────────────────────────────────────────
 # Brillo medio (0-255) por debajo del cual el frame se considera "noche" y se

@@ -24,6 +24,7 @@ from config.settings import (
     CROP_PAD_Y_FRAC,
     CROP_MIN_PAD_PX,
     CAPTURE_TIMESTAMP_TOP_PX,
+    CAPTURE_TIMESTAMP_TOP_FRAC,
 )
 from detectors.yolo_detector import BusDetection
 from preprocessing.night_enhancer import enhance, is_dark_frame
@@ -89,6 +90,30 @@ def crop_quality_score(bbox_ratio: float, bbox_area: int) -> float:
     return ratio_score * 0.7 + area_score * 0.3
 
 
+def _timestamp_band_px(frame_height: int) -> int:
+    """Alto efectivo de la franja del timestamp del DVR, en píxeles."""
+    return min(
+        frame_height,
+        max(CAPTURE_TIMESTAMP_TOP_PX, int(frame_height * CAPTURE_TIMESTAMP_TOP_FRAC)),
+    )
+
+
+def mask_dvr_timestamp(frame: np.ndarray) -> np.ndarray:
+    """
+    Devuelve una copia del frame con la franja superior del timestamp del DVR
+    pintada de negro. Conserva la resolución — útil para pasar a Moondream sin
+    que lea la fecha como número de flota, y para guardar capturas a máxima
+    resolución sin recortar.
+    """
+    if frame is None or frame.size == 0:
+        return frame
+    out = frame.copy()
+    band = _timestamp_band_px(out.shape[0])
+    if band > 0:
+        out[:band, :] = 0
+    return out
+
+
 def extract_full_bus_crop(
     frame: np.ndarray,
     detection: BusDetection,
@@ -98,7 +123,8 @@ def extract_full_bus_crop(
     Return the full bus bounding box as a BGR crop, or None if too small.
 
     Used by the Claude vision backend, which doesn't need tight ROI zones
-    and can locate the number anywhere in the bus image.
+    and can locate the number anywhere in the bus image. La franja del
+    timestamp se pinta negro antes del slice para no achicar el crop.
     """
     x1, y1, x2, y2 = detection.bbox
     pad_x = max(CROP_MIN_PAD_PX, int((x2 - x1) * CROP_PAD_X_FRAC))
@@ -112,13 +138,11 @@ def extract_full_bus_crop(
     x2 = max(0, min(x2, detection.frame_width))
     y2 = max(0, min(y2, detection.frame_height))
 
-    # Avoid the DVR timestamp overlay at the top of the frame.
-    y1 = max(y1, CAPTURE_TIMESTAMP_TOP_PX)
-
     if (x2 - x1) < min_px or (y2 - y1) < min_px:
         return None
 
-    crop = frame[y1:y2, x1:x2].copy()
+    source = mask_dvr_timestamp(frame)
+    crop = source[y1:y2, x1:x2].copy()
     if is_dark_frame(frame):
         crop = enhance(crop)
     return crop
@@ -127,14 +151,13 @@ def extract_full_bus_crop(
 def prepare_capture_frame(frame: np.ndarray) -> np.ndarray:
     """
     Devuelve el frame completo listo para guardar como captura para análisis
-    de daños: borra la franja superior con timestamp del DVR y aplica
-    night-enhance si el frame está oscuro.
+    de daños: tapa la franja del timestamp del DVR (sin recortar, así se
+    preserva la resolución nativa) y aplica night-enhance si el frame está
+    oscuro.
     """
     if frame is None or frame.size == 0:
         return frame
-    h = frame.shape[0]
-    top = min(CAPTURE_TIMESTAMP_TOP_PX, max(0, h // 4))
-    out = frame[top:].copy()
+    out = mask_dvr_timestamp(frame)
     if is_dark_frame(out):
         out = enhance(out)
     return out
