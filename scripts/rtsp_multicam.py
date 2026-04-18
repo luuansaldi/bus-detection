@@ -31,7 +31,7 @@ import cv2
 import numpy as np
 
 from detectors.yolo_detector import BusDetector, BusDetection
-from roi.extractor import extract_rois, extract_full_bus_crop, prepare_capture_frame
+from roi.extractor import extract_rois, extract_full_bus_crop, mask_dvr_timestamp
 from preprocessing.image_processor import process
 from preprocessing.night_enhancer import enhance as night_enhance, is_dark_frame
 from config.settings import YOLO_MIN_CONFIDENCE_NIGHT
@@ -74,6 +74,23 @@ CAM_FIXED_DIRECTION: dict[str, str] = {
 # Cam 3: upper-right area where 3 parked patio buses always sit.
 EXCLUDE_ZONES: dict[str, list[tuple[float, float, float, float]]] = {
     "Cam 3": [(0.35, 0.00, 1.00, 0.50)],
+}
+
+# Encuadre por cámara para las capturas que van a la DB (Gemini).
+# Cada valor es una región relativa (x1, y1, x2, y2) del frame. La clave interna
+# es la dirección del bus — "both" aplica a entering y exiting por igual. Hoy
+# todas las cámaras devuelven el frame completo; las fracciones permiten
+# recortar después sin tocar código.
+# Cam 1/2: laterales del bus (frame entero cubre el lateral).
+# Cam 3: cola del bus entrando, frente saliendo.
+# Cam 4: frente del bus entrando, cola saliendo.
+CAPTURE_FRAMING: dict[str, dict[str, tuple[float, float, float, float]]] = {
+    "Cam 1": {"both":     (0.0, 0.0, 1.0, 1.0)},
+    "Cam 2": {"both":     (0.0, 0.0, 1.0, 1.0)},
+    "Cam 3": {"entering": (0.0, 0.0, 1.0, 1.0),
+              "exiting":  (0.0, 0.0, 1.0, 1.0)},
+    "Cam 4": {"entering": (0.0, 0.0, 1.0, 1.0),
+              "exiting":  (0.0, 0.0, 1.0, 1.0)},
 }
 
 # Cameras that detect direction via Moondream orientation (single call, same crop).
@@ -635,8 +652,11 @@ class ConsensusBuffer:
 
     Events are 4-tuples: (event_type, number, direction, extra)
       provisional : (type, number, direction, cam_label)
-      confirmed   : (type, number, direction, crops_dict)   # {cam_label: crop}
+      confirmed   : (type, number, direction, None)
       conflict    : (type, first_number, direction, second_number)
+
+    Las capturas que van a la DB las arma `_report` desde `state.frame` de
+    cada cámara — el buffer ya no guarda imágenes.
     """
 
     def __init__(self, max_window_sec: float = 6.0, number_cooldown_sec: float = 10.0):
@@ -647,17 +667,13 @@ class ConsensusBuffer:
         self._window_start: float | None = None
         self._reported: dict[int, float] = {}
         self._reported_dir: dict[int, str] = {}   # direction at confirmation time
-        self._crops: dict[str, any] = {}   # cam_label → crop (one per camera)
-        self._crop_scores: dict[str, float] = {}  # cam_label → quality score
         self._lock = threading.Lock()
 
-    def feed(self, result: tuple[int, str] | None, cam_label: str, crop=None,
-             bbox_ratio: float = 0.0, bbox_area: int = 0) -> list[tuple]:
+    def feed(self, result: tuple[int, str] | None, cam_label: str) -> list[tuple]:
         now = time.monotonic()
         events: list[tuple] = []
         with self._lock:
             if self._window_start is None:
-                # No window open — first vote opens it and emits provisional
                 if result is not None:
                     number, direction = result
                     # Direction upgrade: bus was just confirmed with unknown direction,
@@ -672,31 +688,14 @@ class ConsensusBuffer:
                         return events
                     self._window_start = now
                     self._votes = [(number, direction, cam_label)]
-                    if crop is not None:
-                        from preprocessing.night_enhancer import sharpness
-                        score = sharpness(crop)
-                        self._crops = {cam_label: crop}
-                        self._crop_scores = {cam_label: score}
-                    else:
-                        self._crops = {}
-                        self._crop_scores = {}
                     events.append(("provisional", number, direction, cam_label))
-                    # Authoritative cameras (Cam 1/Cam 2) confirm immediately — no second vote needed
                     if cam_label in CAM_FIXED_DIRECTION:
                         events.extend(self._close(now))
             else:
-                # Window already open — store crop if it's sharper than what we have
-                if crop is not None:
-                    from preprocessing.night_enhancer import sharpness
-                    score = sharpness(crop)
-                    if score > self._crop_scores.get(cam_label, -1.0):
-                        self._crops[cam_label] = crop
-                        self._crop_scores[cam_label] = score
                 if result is not None:
                     number, direction = result
                     self._votes.append((number, direction, cam_label))
                     cams_voted = {lbl for _, _, lbl in self._votes}
-                    # Close immediately if authoritative camera voted or second camera confirmed
                     if cam_label in CAM_FIXED_DIRECTION or len(cams_voted) >= 2:
                         events.extend(self._close(now))
                 elif now - self._window_start >= self.max_window_sec:
@@ -745,14 +744,8 @@ class ConsensusBuffer:
             # All votes agree
             self._reported[winner] = now
             self._reported_dir[winner] = direction
-            crops = self._crops
-            self._crops = {}
-            self._crop_scores = {}
-            return [("confirmed", winner, direction, crops)]
+            return [("confirmed", winner, direction, None)]
         else:
-            # Conflict: return most-voted competing number as extra
-            self._crops = {}
-            self._crop_scores = {}
             rival = max(distinct, key=counts.__getitem__)
             return [("conflict", winner, direction, rival)]
 
@@ -1070,14 +1063,9 @@ def ocr_worker(
                 print(f"  [{label}] OCR ERROR: {e}")
                 raw = None
 
-            # Save the FULL camera frame (timestamp removed, night-enhanced if
-            # dark) for later AI damage analysis. Each camera contributes its
-            # complete view so laterales, frente y cola del bus quedan visibles
-            # en el set guardado.
-            capture_crop = prepare_capture_frame(frame)
-            capture_area = capture_crop.shape[0] * capture_crop.shape[1]
-            events = global_buffer.feed(raw, label, crop=capture_crop,
-                                        bbox_ratio=1.0, bbox_area=capture_area)
+            # El buffer solo contabiliza votos — las capturas para DB se
+            # construyen en `_report` tomando el frame actual de cada cámara.
+            events = global_buffer.feed(raw, label)
 
             if debug and raw is not None:
                 votes = global_buffer.all_votes()
@@ -1132,12 +1120,14 @@ def _run_ocr(bus_crop, best, frame, bbox_ratio, fw, fh,
         direction = motion_filter.get_direction(best) or "unknown"
         return None
     elif bbox_ratio > 0.60:
+        from roi.extractor import mask_dvr_timestamp
+        masked = mask_dvr_timestamp(frame)
         hw, hh = fw // 2, fh // 2
         subcrops = [
-            frame[0:hh,  0:hw],
-            frame[0:hh,  hw:fw],
-            frame[hh:fh, 0:hw],
-            frame[hh:fh, hw:fw],
+            masked[0:hh,  0:hw],
+            masked[0:hh,  hw:fw],
+            masked[hh:fh, 0:hw],
+            masked[hh:fh, hw:fw],
         ]
         if debug:
             print(f"  [{label}] BUS GRANDE ({bbox_ratio:.0%} frame) → probando sub-crops")
@@ -1230,8 +1220,8 @@ def _handle_event(event: tuple, frame, all_states: dict) -> None:
             with s.lock:
                 s.confirmed_label = label
     elif event_type == "confirmed":
-        _, number, direction, crops_dict = event
-        _report(number, direction, crops_dict if crops_dict else {}, frame, all_states)
+        _, number, direction, _ = event
+        _report(number, direction, all_states)
     elif event_type == "direction_update":
         _, number, direction, _ = event
         if direction == "entering":
@@ -1253,7 +1243,36 @@ def _handle_event(event: tuple, frame, all_states: dict) -> None:
         print(f"[{ts}] ⚠️  CONFLICTO: primera lectura={first_number}, segunda lectura={rival} — descartado")
 
 
-def _report(number: int, direction: str, crops_dict: dict, fallback_frame: np.ndarray, all_states: dict) -> None:
+def build_capture(frame: np.ndarray, cam_label: str, direction: str) -> np.ndarray | None:
+    """
+    Construye la captura final que va a disco/DB para una cámara:
+    - pinta la franja del timestamp del DVR
+    - aplica night-enhance si está oscuro
+    - recorta según `CAPTURE_FRAMING[cam_label]` (entering/exiting/both) en
+      coordenadas relativas del frame.
+    Conserva la resolución nativa del stream — no se hace resize.
+    """
+    if frame is None or frame.size == 0:
+        return None
+
+    framing_map = CAPTURE_FRAMING.get(cam_label, {})
+    rect = framing_map.get(direction) or framing_map.get("both") or framing_map.get("entering")
+    if rect is None:
+        rect = (0.0, 0.0, 1.0, 1.0)
+
+    out = mask_dvr_timestamp(frame)
+    if is_dark_frame(out):
+        out = night_enhance(out)
+
+    h, w = out.shape[:2]
+    x1 = max(0, min(int(rect[0] * w), w - 1))
+    y1 = max(0, min(int(rect[1] * h), h - 1))
+    x2 = max(x1 + 1, min(int(rect[2] * w), w))
+    y2 = max(y1 + 1, min(int(rect[3] * h), h))
+    return out[y1:y2, x1:x2].copy()
+
+
+def _report(number: int, direction: str, all_states: dict) -> None:
     ts_log  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ts_file = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1272,23 +1291,34 @@ def _report(number: int, direction: str, crops_dict: dict, fallback_frame: np.nd
     captures_dir.mkdir(exist_ok=True)
     tag = f"_{direction}" if direction != "unknown" else ""
 
-    # Main image: first available crop or fallback frame
-    main_crop = next(iter(crops_dict.values()), fallback_frame) if crops_dict else fallback_frame
-    main_filename = captures_dir / f"{ts_file}_{number}{tag}.jpg"
-    cv2.imwrite(str(main_filename), main_crop)
-
-    # Save per-camera crops
+    # Snapshot del frame actual de cada cámara y armado de captura independiente.
+    # `all_states` está indexado por cam_key (int 1..4) — ordenamos por esa clave.
     saved_crop_paths: dict[str, str] = {}
-    for cam_label, crop in crops_dict.items():
-        if crop is None:
+    for cam_key in sorted(all_states.keys()):
+        state = all_states[cam_key]
+        cam_label = state.label
+        with state.lock:
+            snap = state.frame.copy() if state.frame is not None else None
+        if snap is None:
+            print(f"  [CROP] {cam_label} → sin señal")
+            continue
+        capture = build_capture(snap, cam_label, direction)
+        if capture is None or capture.size == 0:
+            print(f"  [CROP] {cam_label} → frame inválido")
             continue
         cam_slug = cam_label.lower().replace(" ", "")
         crop_filename = captures_dir / f"{ts_file}_{number}_{cam_slug}{tag}.jpg"
-        cv2.imwrite(str(crop_filename), crop)
+        cv2.imwrite(str(crop_filename), capture)
         saved_crop_paths[cam_label] = str(crop_filename)
-        print(f"  [CROP] {cam_label} → {crop_filename.name}")
+        print(f"  [CROP] {cam_label} → {crop_filename.name} ({capture.shape[1]}×{capture.shape[0]})")
 
-    nueva_id, is_new = db_insertar(number, direction, str(main_filename), crop_paths=saved_crop_paths)
+    # Imagen principal: preferimos Cam 1 si hay (barrera), si no la primera disponible.
+    main_path = saved_crop_paths.get("Cam 1") or next(iter(saved_crop_paths.values()), None)
+    if main_path is None:
+        # Ninguna cámara tenía frame — grabamos la detección igual sin imagen
+        main_path = str(captures_dir / f"{ts_file}_{number}{tag}.jpg")
+
+    nueva_id, is_new = db_insertar(number, direction, main_path, crop_paths=saved_crop_paths)
     if not is_new:
         print(f"  [MERGE] Agregado a detección existente id={nueva_id}")
 
@@ -1298,7 +1328,7 @@ def _report(number: int, direction: str, crops_dict: dict, fallback_frame: np.nd
         "timestamp": ts_log,
         "numero_flota": number,
         "direccion": direction,
-        "imagen_path": str(main_filename),
+        "imagen_path": main_path,
         "crops": {cam: Path(p).name for cam, p in saved_crop_paths.items()},
     })
 
@@ -1310,7 +1340,7 @@ def _report(number: int, direction: str, crops_dict: dict, fallback_frame: np.nd
             detection_id=nueva_id,
             numero_flota=number,
             direccion=direction,
-            fallback_path=str(main_filename),
+            fallback_path=main_path,
         )
 
     for s in all_states.values():
