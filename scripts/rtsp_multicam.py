@@ -40,7 +40,7 @@ from filters.candidate_filter import select_best
 from web.database import init_db, insertar as db_insertar, actualizar_direccion as db_actualizar_direccion
 from web.app import emit_event
 
-BASE_URL = "rtsp://test:fono1234@192.168.1.63:34224/cam/realmonitor"
+BASE_URL = "rtsp://test:fono1234@190.220.138.178:34224/cam/realmonitor"
 RECONNECT_DELAY = 5
 
 CAMERAS = {
