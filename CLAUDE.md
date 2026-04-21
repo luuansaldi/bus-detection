@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 source .venv/bin/activate
-pip install -r requirements.txt   # ultralytics, opencv-python, transformers, torch, pillow, easyocr, numpy
+pip install -r requirements.txt   # ultralytics, opencv-python, transformers, torch, pillow, numpy
 ```
 
 Python 3.11. All scripts use `sys.path.insert(0, project_root)` so they must be run from the repo root.
@@ -20,14 +20,8 @@ python scripts/detect_fleet.py --image test_images/frame.jpg --verbose
 # Test only YOLO detection
 python scripts/test_detection.py --image test_images/frame.jpg --save
 
-# Test ROI zone extraction (saves annotated image + individual crops)
-python scripts/test_roi.py --image test_images/frame.jpg
-
-# Live RTSP multi-camera stream (4 cameras) — default OCR: moondream
+# Live RTSP multi-camera stream (4 cameras)
 python scripts/rtsp_multicam.py --debug
-
-# Live RTSP single camera with keyboard switching (1/2/3/4) — legacy EasyOCR only
-python scripts/rtsp_stream.py
 
 # Web dashboard (open http://localhost:8000 in browser)
 .venv/bin/python -m uvicorn web.app:app --port 8000
@@ -35,37 +29,26 @@ python scripts/rtsp_stream.py
 
 ## Architecture
 
-### OCR backends
+### OCR pipeline
 
-There are two backends, selectable via `--ocr-backend`:
-
-**Moondream (default):** sends the full bus bounding box crop to a local vision model (`vikhyatk/moondream2`). Skips the ROI/preprocessing/EasyOCR stages entirely.
+Moondream is the only OCR backend. Envía el bus bbox completo a `vikhyatk/moondream2` (vision model local).
 ```
 Frame → BusDetector → extract_full_bus_crop → MoondreamReader → int | None
 ```
 
-**EasyOCR (legacy):** crops sub-zones from the bus bbox, generates image variants, and runs character-level OCR.
-```
-Frame → BusDetector → extract_rois → process (variants) → read_candidates → select_best → int | None
-```
-
-Key files for each stage:
+Key files:
 ```
 detectors/yolo_detector.py       BusDetection objects
-roi/extractor.py                 ROICrop (EasyOCR path) / full crop (Moondream path)
-preprocessing/image_processor.py ProcessedVariant (EasyOCR path only)
-ocr/reader.py                    EasyOCR — module-level singleton via get_reader()
-ocr/moondream_reader.py          Moondream2 — module-level singleton via get_moondream_reader()
-filters/candidate_filter.py      EasyOCR path only — select_best()
+roi/extractor.py                 extract_full_bus_crop + mask_dvr_timestamp
+ocr/moondream_reader.py          Moondream2 — singleton vía get_moondream_reader()
 ```
 
-`scripts/detect_fleet.py` is the reference implementation that wires all stages together on a single image.
+`scripts/detect_fleet.py` es la referencia single-image.
 
 **Key design decisions:**
-- `BusDetector` loads YOLO on `__init__` — instantiate once per thread, never per frame.
-- `MoondreamReader` lazy-loads on first call (~1.8 GB download). Uses MPS on Apple Silicon, CUDA if available, CPU otherwise. Thread-safe via an internal lock (moondream is not thread-safe).
-- ROI zones (EasyOCR path) are relative fractions of the bus bounding box (defined in `roi/extractor.py:ZONES`). Four zones cover rear, lateral, front-lateral, and a wide fallback.
-- Valid fleet numbers: 10–1500, configured in `config/settings.py`.
+- `BusDetector` carga YOLO en `__init__` — instanciar una vez por thread, nunca por frame.
+- `MoondreamReader` lazy-loads en la primera llamada (~1.8 GB). Usa MPS en Apple Silicon, CUDA si está disponible, CPU si no. Thread-safe vía lock interno (moondream no es thread-safe).
+- Números válidos de flota: cargados desde `config/internos.csv`.
 
 ## Live stream architecture (`rtsp_multicam.py`)
 
@@ -73,7 +56,7 @@ Three threads per camera: **reader** + **yolo_worker** + **ocr_worker**. A singl
 
 - **reader**: reads frames from RTSP continuously, stores latest in `state.frame`, queues every Nth frame for YOLO via `state.process_event`.
 - **yolo_worker**: runs YOLO + `MotionFilter` on every queued frame. When a moving bus is found, puts the crop into `state.ocr_queue` (maxsize=1 — drops stale crops if OCR is busy) and updates the display overlay immediately.
-- **ocr_worker**: blocks on `state.ocr_queue`, runs Moondream (or EasyOCR) on the crop, feeds result to `ConsensusBuffer`. Runs independently so YOLO is never blocked by OCR inference.
+- **ocr_worker**: blocks on `state.ocr_queue`, runs Moondream on the crop, feeds result to `ConsensusBuffer`. Runs independently so YOLO is never blocked by OCR inference.
 
 This decoupling means YOLO tracks buses at full frame rate regardless of how long Moondream takes.
 
@@ -108,11 +91,9 @@ Minimum net displacement to assign a direction: `MIN_DIRECTION_PX = 80`.
 | `YOLO_MODEL` | `yolov8m.pt` | Reliable on all 3 CCTV angles; `yolov8n.pt` misses awkward shots |
 | `YOLO_MIN_CONFIDENCE` | 0.40 | |
 | `YOLO_BUS_CLASS_IDS` | `[5, 7]` | 5=bus, 7=truck (rear close-ups sometimes classified as truck) |
-| `FLEET_MIN` / `FLEET_MAX` | 10 / 1500 | |
-| `FLEET_BLACKLIST` | `{90}` | Numbers explicitly rejected (e.g. speed limit signs painted on buses) |
-| `FLEET_YEAR_THRESHOLD` | 2000 | 4-digit numbers ≥ this are rejected as years (not applicable given max=1500) |
-| `OCR_MIN_CONFIDENCE` | 0.65 | EasyOCR path only |
-| `CLAUDE_OCR_MODEL` | `claude-haiku-4-5-20251001` | Unused in current default flow |
+| `FLEET_WHITELIST` | `config/internos.csv` | Números aceptados cargados del CSV |
+| `FLEET_YEAR_THRESHOLD` | 2000 | 4-digit numbers ≥ this are rejected as years |
+| `DIRECTION_LABELS` | `entering/exiting → entrando/saliendo` | Traducción para UI/logs |
 
 ## Captured images
 

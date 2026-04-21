@@ -8,6 +8,7 @@ Cada vez que el sistema detecta un bus con consenso, se guarda una fila con:
   - ruta a la imagen capturada
 """
 
+import json
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -68,6 +69,12 @@ def init_db() -> None:
             pass
         try:
             conn.execute("ALTER TABLE detecciones ADD COLUMN analisis_estado TEXT")  # ok / danado / inconcluye / error / pendiente
+        except Exception:
+            pass
+        # Migración: comparaciones N-way. detection_ids es un JSON array de ints.
+        # Para filas viejas queda NULL y se usan salida_id/entrada_id.
+        try:
+            conn.execute("ALTER TABLE comparaciones ADD COLUMN detection_ids TEXT")
         except Exception:
             pass
 
@@ -182,49 +189,6 @@ def actualizar_analisis_individual(detection_id: int, analisis: str, estado: str
         )
 
 
-def get_ultima_salida_con_analisis(numero_flota: int) -> dict | None:
-    """
-    Retorna la última detección 'exiting' del bus que YA tiene análisis individual
-    y todavía no fue comparada contra una entrada. None si no existe.
-    """
-    with get_conn() as conn:
-        row = conn.execute(
-            """SELECT d.id, d.timestamp, d.imagen_path, d.analisis_individual
-               FROM detecciones d
-               WHERE d.numero_flota = ?
-                 AND d.direccion = 'exiting'
-                 AND d.analisis_individual IS NOT NULL
-                 AND NOT EXISTS (
-                     SELECT 1 FROM comparaciones c WHERE c.salida_id = d.id
-                 )
-               ORDER BY d.timestamp DESC LIMIT 1""",
-            (numero_flota,),
-        ).fetchone()
-    return dict(row) if row else None
-
-
-def get_deteccion_entrada_pendiente(numero_flota: int, desde_ts: str) -> dict | None:
-    """
-    Retorna la primera detección 'entering' con análisis individual posterior a
-    desde_ts que aún no tiene comparación registrada. None si no existe.
-    """
-    with get_conn() as conn:
-        row = conn.execute(
-            """SELECT d.id, d.timestamp, d.imagen_path, d.analisis_individual
-               FROM detecciones d
-               WHERE d.numero_flota = ?
-                 AND d.direccion = 'entering'
-                 AND d.timestamp > ?
-                 AND d.analisis_individual IS NOT NULL
-                 AND NOT EXISTS (
-                     SELECT 1 FROM comparaciones c WHERE c.entrada_id = d.id
-                 )
-               ORDER BY d.timestamp ASC LIMIT 1""",
-            (numero_flota, desde_ts),
-        ).fetchone()
-    return dict(row) if row else None
-
-
 def actualizar_direccion(numero_flota: int, direccion: str) -> bool:
     """Actualiza la dirección de la detección más reciente de este bus (si era 'unknown')."""
     with get_conn() as conn:
@@ -237,40 +201,36 @@ def actualizar_direccion(numero_flota: int, direccion: str) -> bool:
         return cur.rowcount > 0
 
 
-def get_ultima_salida(numero_flota: int) -> dict | None:
-    """Retorna la detección exiting más reciente del bus, o None si no existe."""
-    with get_conn() as conn:
-        row = conn.execute(
-            """SELECT id, imagen_path FROM detecciones
-               WHERE numero_flota = ? AND direccion = 'exiting'
-               ORDER BY timestamp DESC LIMIT 1""",
-            (numero_flota,),
-        ).fetchone()
-    return dict(row) if row else None
-
-
-def insertar_comparacion(numero_flota: int, salida_id: int, entrada_id: int,
-                          resultado: str, descripcion: str,
-                          severidad: str = "desconocida") -> int:
-    """Guarda el resultado de la comparación de daños. Retorna el id."""
+def insertar_comparacion_n(numero_flota: int, detection_ids: list[int],
+                            resultado: str, descripcion: str,
+                            severidad: str = "desconocida") -> int:
+    """
+    Guarda una comparación de N capturas. Si el set tiene exactamente una
+    entrada y una salida, también llena salida_id/entrada_id para compatibilidad
+    con vistas viejas. detection_ids se persiste como JSON.
+    """
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    salida_id = entrada_id = None
     with get_conn() as conn:
+        if detection_ids:
+            placeholders = ",".join("?" * len(detection_ids))
+            rows = conn.execute(
+                f"SELECT id, direccion FROM detecciones WHERE id IN ({placeholders})",
+                detection_ids,
+            ).fetchall()
+            salidas  = [r["id"] for r in rows if r["direccion"] == "exiting"]
+            entradas = [r["id"] for r in rows if r["direccion"] == "entering"]
+            if len(salidas) == 1 and len(entradas) == 1:
+                salida_id, entrada_id = salidas[0], entradas[0]
         cur = conn.execute(
             """INSERT INTO comparaciones
-               (numero_flota, salida_id, entrada_id, resultado, severidad, descripcion, timestamp_analisis)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (numero_flota, salida_id, entrada_id, resultado, severidad, descripcion, ts),
+               (numero_flota, salida_id, entrada_id, resultado, severidad,
+                descripcion, timestamp_analisis, detection_ids)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (numero_flota, salida_id, entrada_id, resultado, severidad,
+             descripcion, ts, json.dumps(detection_ids)),
         )
         return cur.lastrowid
-
-
-def get_comparacion(comp_id: int) -> dict | None:
-    """Retorna una comparación por id."""
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT * FROM comparaciones WHERE id = ?", (comp_id,)
-        ).fetchone()
-    return dict(row) if row else None
 
 
 def get_deteccion_by_id(det_id: int) -> dict | None:
@@ -362,18 +322,31 @@ def stats_por_numero() -> list[dict]:
                 cap["crops"] = [dict(cr) for cr in crops]
                 capturas_list.append(cap)
             ultimo_analisis = conn.execute("""
-                SELECT id, resultado, severidad, descripcion, timestamp_analisis
+                SELECT id, resultado, severidad, descripcion, timestamp_analisis,
+                       salida_id, entrada_id, detection_ids
                 FROM comparaciones
                 WHERE numero_flota = ?
                 ORDER BY id DESC LIMIT 1
             """, (bus["numero_flota"],)).fetchone()
+            ua = None
+            if ultimo_analisis:
+                ua = dict(ultimo_analisis)
+                if ua.get("detection_ids"):
+                    try:
+                        ua["detection_ids"] = json.loads(ua["detection_ids"])
+                    except Exception:
+                        ua["detection_ids"] = []
+                else:
+                    # fila vieja: derivar del par salida/entrada si existen
+                    legacy = [i for i in (ua.get("salida_id"), ua.get("entrada_id")) if i]
+                    ua["detection_ids"] = legacy
             result.append({
                 "numero_flota":    bus["numero_flota"],
                 "total":           bus["total"],
                 "entradas":        bus["entradas"],
                 "salidas":         bus["salidas"],
                 "capturas":        capturas_list,
-                "ultimo_analisis": dict(ultimo_analisis) if ultimo_analisis else None,
+                "ultimo_analisis": ua,
             })
     return result
 
@@ -492,6 +465,40 @@ def set_main_image(detection_id: int, cam_label: str) -> bool:
             (row["crop_path"], detection_id),
         )
     return True
+
+
+def eliminar_bus(numero_flota: int) -> tuple[int, list[str]]:
+    """Borra todas las detecciones (+ crops + comparaciones) de un bus.
+
+    Retorna (cantidad_detecciones_borradas, lista_paths_a_borrar_del_disco).
+    """
+    paths: list[str] = []
+    with get_conn() as conn:
+        det_rows = conn.execute(
+            "SELECT id, imagen_path FROM detecciones WHERE numero_flota = ?",
+            (numero_flota,),
+        ).fetchall()
+        if not det_rows:
+            return 0, paths
+        det_ids = [r["id"] for r in det_rows]
+        placeholders = ",".join("?" * len(det_ids))
+
+        for r in det_rows:
+            if r["imagen_path"]:
+                paths.append(r["imagen_path"])
+        crop_rows = conn.execute(
+            f"SELECT crop_path FROM detection_crops WHERE detection_id IN ({placeholders})",
+            det_ids,
+        ).fetchall()
+        for cr in crop_rows:
+            if cr["crop_path"] and cr["crop_path"] not in paths:
+                paths.append(cr["crop_path"])
+
+        conn.execute(f"DELETE FROM detection_crops WHERE detection_id IN ({placeholders})", det_ids)
+        conn.execute("DELETE FROM comparaciones WHERE numero_flota = ?", (numero_flota,))
+        conn.execute("DELETE FROM detecciones WHERE numero_flota = ?", (numero_flota,))
+
+    return len(det_ids), paths
 
 
 def eliminar_deteccion(detection_id: int) -> list[str]:

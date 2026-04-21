@@ -14,7 +14,6 @@ Usage:
 """
 
 import argparse
-import queue
 import sys
 import threading
 import time
@@ -31,12 +30,10 @@ import cv2
 import numpy as np
 
 from detectors.yolo_detector import BusDetector, BusDetection
-from roi.extractor import extract_rois, extract_full_bus_crop, mask_dvr_timestamp
-from preprocessing.image_processor import process
+from roi.extractor import extract_full_bus_crop, mask_dvr_timestamp
 from preprocessing.night_enhancer import enhance as night_enhance, is_dark_frame
-from config.settings import YOLO_MIN_CONFIDENCE_NIGHT
-from ocr.reader import read_candidates
-from filters.candidate_filter import select_best
+from config.settings import YOLO_MIN_CONFIDENCE_NIGHT, DIRECTION_LABELS
+from ocr.moondream_reader import get_moondream_reader
 from web.database import init_db, insertar as db_insertar, actualizar_direccion as db_actualizar_direccion
 from web.app import emit_event
 
@@ -480,6 +477,14 @@ class MotionFilter:
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 
+def _save_debug_crop(bus_crop, label: str, suffix: str = "normal") -> None:
+    """Dump a bus crop to captures/crop_debug/ for offline inspection."""
+    dump_dir = Path(__file__).resolve().parent.parent / "captures" / "crop_debug"
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%H%M%S_%f")[:9]
+    cv2.imwrite(str(dump_dir / f"{ts}_{label.replace(' ','')}_{suffix}.jpg"), bus_crop)
+
+
 def process_frame(
     frame,
     detector: BusDetector,
@@ -487,7 +492,6 @@ def process_frame(
     min_bbox: int = 120,
     label: str = "",
     debug: bool = False,
-    ocr_backend: str = "claude",
 ) -> tuple[tuple | None, tuple | None]:
     """Returns (result, bbox) where bbox is (x1,y1,x2,y2) of the bus sent to OCR."""
     detections = detector.detect(frame)
@@ -550,93 +554,50 @@ def process_frame(
     if debug and len(moving) > 1:
         print(f"  [{label}] {len(moving)} buses en movimiento → usando el más cercano (área={best.area}px²)")
 
-    if ocr_backend == "moondream":
-        from ocr.moondream_reader import get_moondream_reader
-        bus_crop = extract_full_bus_crop(frame, best)
-        if bus_crop is None:
-            if debug:
-                print(f"  [{label}] CROP: demasiado pequeño")
-            return None, None
-
-        # If the bus bbox covers > 40% of the frame the bus is too close and
-        # the full crop won't show the number. Split the frame into 4 quadrants
-        # and try each one — the number will be in one of the corners.
-        fh, fw = frame.shape[:2]
-        x1, y1, x2, y2 = best.bbox
-        bbox_ratio = ((x2 - x1) * (y2 - y1)) / (fw * fh)
-        if bbox_ratio > 0.60 and label in ORIENTATION_TO_DIRECTION:
-            # Cam 1 / Cam 2: bus too close, number not readable. Skip OCR and let
-            # the other camera handle it. Direction still tracked via MotionFilter.
-            if debug:
-                print(f"  [{label}] BUS GRANDE ({bbox_ratio:.0%} frame) → skip OCR, bus demasiado cerca")
-            direction = motion_filter.get_direction(best) or "unknown"
-            return None, best.bbox
-        elif bbox_ratio > 0.60:
-            # Cam 3 (OCR-only): bus large but still try sub-crops — no other cam to rely on.
-            hw, hh = fw // 2, fh // 2
-            subcrops = [
-                frame[0:hh,  0:hw],
-                frame[0:hh,  hw:fw],
-                frame[hh:fh, 0:hw],
-                frame[hh:fh, hw:fw],
-            ]
-            if debug:
-                print(f"  [{label}] BUS GRANDE ({bbox_ratio:.0%} frame) → probando sub-crops")
-            number = get_moondream_reader().read_subcrops(subcrops)
-            direction = "unknown"
-        elif label in ORIENTATION_TO_DIRECTION:
-            # Single call: read number + orientation, then map orientation → direction.
-            number, orientation = get_moondream_reader().read_with_orientation(bus_crop, cam_label=label)
-            orientation_map = ORIENTATION_TO_DIRECTION[label]
-            direction = orientation_map.get(orientation or "", "unknown")
-            # Moondream couldn't determine orientation — fall back to MotionFilter
-            if direction == "unknown":
-                direction = motion_filter.get_direction(best) or "unknown"
-            if debug and number is None:
-                dump_dir = Path(__file__).resolve().parent.parent / "captures" / "crop_debug"
-                dump_dir.mkdir(parents=True, exist_ok=True)
-                ts = datetime.now().strftime("%H%M%S_%f")[:9]
-                cv2.imwrite(str(dump_dir / f"{ts}_{label.replace(' ','')}_normal.jpg"), bus_crop)
-        else:
-            number = get_moondream_reader().read(bus_crop, cam_label=label)
-            direction = "unknown"
-            if debug and number is None:
-                dump_dir = Path(__file__).resolve().parent.parent / "captures" / "crop_debug"
-                dump_dir.mkdir(parents=True, exist_ok=True)
-                ts = datetime.now().strftime("%H%M%S_%f")[:9]
-                cv2.imwrite(str(dump_dir / f"{ts}_{label.replace(' ','')}_normal.jpg"), bus_crop)
-
+    bus_crop = extract_full_bus_crop(frame, best)
+    if bus_crop is None:
         if debug:
-            print(f"  [{label}] MOONDREAM: {number if number else 'none'} dir={direction}")
-        return ((number, direction) if number else None), best.bbox
-
-    # ── EasyOCR path (legacy) ──────────────────────────────────────────────
-    crops = extract_rois(frame, best)
-    if not crops:
-        if debug:
-            print(f"  [{label}] ROI: sin crops válidos")
+            print(f"  [{label}] CROP: demasiado pequeño")
         return None, None
 
-    all_candidates = []
-    for crop in crops:
-        variants = process(crop.image)
-        for variant in variants:
-            candidates = read_candidates(variant.image, crop.zone_name, variant.name)
-            if debug and candidates:
-                for c in candidates:
-                    print(f"  [{label}] OCR: zona={c.zone_name} texto='{c.text}' conf={c.confidence:.2f}")
-            all_candidates.extend(candidates)
+    fh, fw = frame.shape[:2]
+    x1, y1, x2, y2 = best.bbox
+    bbox_ratio = ((x2 - x1) * (y2 - y1)) / (fw * fh)
+    if bbox_ratio > 0.60 and label in ORIENTATION_TO_DIRECTION:
+        # Cam 1 / Cam 2: bus too close, number not readable. Skip OCR and let
+        # the other camera handle it. Direction still tracked via MotionFilter.
+        if debug:
+            print(f"  [{label}] BUS GRANDE ({bbox_ratio:.0%} frame) → skip OCR, bus demasiado cerca")
+        return None, best.bbox
+    elif bbox_ratio > 0.60:
+        hw, hh = fw // 2, fh // 2
+        subcrops = [
+            frame[0:hh,  0:hw],
+            frame[0:hh,  hw:fw],
+            frame[hh:fh, 0:hw],
+            frame[hh:fh, hw:fw],
+        ]
+        if debug:
+            print(f"  [{label}] BUS GRANDE ({bbox_ratio:.0%} frame) → probando sub-crops")
+        number = get_moondream_reader().read_subcrops(subcrops)
+        direction = "unknown"
+    elif label in ORIENTATION_TO_DIRECTION:
+        number, orientation = get_moondream_reader().read_with_orientation(bus_crop, cam_label=label)
+        orientation_map = ORIENTATION_TO_DIRECTION[label]
+        direction = orientation_map.get(orientation or "", "unknown")
+        if direction == "unknown":
+            direction = motion_filter.get_direction(best) or "unknown"
+        if debug and number is None:
+            _save_debug_crop(bus_crop, label)
+    else:
+        number = get_moondream_reader().read(bus_crop, cam_label=label)
+        direction = "unknown"
+        if debug and number is None:
+            _save_debug_crop(bus_crop, label)
 
-    if debug and not all_candidates:
-        print(f"  [{label}] OCR: sin candidatos")
-
-    result = select_best(all_candidates)
     if debug:
-        if result:
-            print(f"  [{label}] RESULTADO: {result.number} (score={result.score:.2f})")
-        else:
-            print(f"  [{label}] RESULTADO: descartado por filtro")
-    return ((result.number, direction) if result else None), best.bbox
+        print(f"  [{label}] MOONDREAM: {number if number else 'none'} dir={direction}")
+    return ((number, direction) if number else None), best.bbox
 
 
 # ── Consensus buffer (shared across all cameras) ──────────────────────────────
@@ -1042,7 +1003,6 @@ def ocr_worker(
     all_states: dict,
     motion_filter: MotionFilter,
     debug: bool = False,
-    ocr_backend: str = "moondream",
 ) -> None:
     """
     Consumes crops from state.ocr_queue and runs Moondream OCR.
@@ -1057,7 +1017,7 @@ def ocr_worker(
             try:
                 raw = _run_ocr(
                     bus_crop, best, frame, bbox_ratio, fw, fh,
-                    motion_filter, label, debug, ocr_backend,
+                    motion_filter, label, debug,
                 )
             except Exception as e:
                 print(f"  [{label}] OCR ERROR: {e}")
@@ -1082,45 +1042,13 @@ def ocr_worker(
 
 
 def _run_ocr(bus_crop, best, frame, bbox_ratio, fw, fh,
-             motion_filter, label, debug, ocr_backend):
-    """Runs the OCR backend and returns (number, direction) or None."""
-    if ocr_backend != "moondream":
-        # EasyOCR legacy path
-        from roi.extractor import extract_rois
-        crops = extract_rois(frame, best)
-        if not crops:
-            if debug:
-                print(f"  [{label}] ROI: sin crops válidos")
-            return None
-        all_candidates = []
-        for crop in crops:
-            variants = process(crop.image)
-            for variant in variants:
-                candidates = read_candidates(variant.image, crop.zone_name, variant.name)
-                if debug and candidates:
-                    for c in candidates:
-                        print(f"  [{label}] OCR: zona={c.zone_name} texto='{c.text}' conf={c.confidence:.2f}")
-                all_candidates.extend(candidates)
-        if debug and not all_candidates:
-            print(f"  [{label}] OCR: sin candidatos")
-        result = select_best(all_candidates)
-        if debug:
-            if result:
-                print(f"  [{label}] RESULTADO: {result.number} (score={result.score:.2f})")
-            else:
-                print(f"  [{label}] RESULTADO: descartado por filtro")
-        direction = motion_filter.get_direction(best) or "unknown"
-        return (result.number, direction) if result else None
-
-    from ocr.moondream_reader import get_moondream_reader
-
+             motion_filter, label, debug):
+    """Runs Moondream OCR and returns (number, direction) or None."""
     if bbox_ratio > 0.60 and label in ORIENTATION_TO_DIRECTION:
         if debug:
             print(f"  [{label}] BUS GRANDE ({bbox_ratio:.0%} frame) → skip OCR, bus demasiado cerca")
-        direction = motion_filter.get_direction(best) or "unknown"
         return None
     elif bbox_ratio > 0.60:
-        from roi.extractor import mask_dvr_timestamp
         masked = mask_dvr_timestamp(frame)
         hw, hh = fw // 2, fh // 2
         subcrops = [
@@ -1144,18 +1072,12 @@ def _run_ocr(bus_crop, best, frame, bbox_ratio, fw, fh,
             orientation_map = ORIENTATION_TO_DIRECTION[label]
             direction = orientation_map.get(orientation or "", "unknown")
         if debug and number is None:
-            dump_dir = Path(__file__).resolve().parent.parent / "captures" / "crop_debug"
-            dump_dir.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now().strftime("%H%M%S_%f")[:9]
-            cv2.imwrite(str(dump_dir / f"{ts}_{label.replace(' ','')}_normal.jpg"), bus_crop)
+            _save_debug_crop(bus_crop, label)
     else:
         number = get_moondream_reader().read(bus_crop, cam_label=label)
         direction = "unknown"
         if debug and number is None:
-            dump_dir = Path(__file__).resolve().parent.parent / "captures" / "crop_debug"
-            dump_dir.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now().strftime("%H%M%S_%f")[:9]
-            cv2.imwrite(str(dump_dir / f"{ts}_{label.replace(' ','')}_normal.jpg"), bus_crop)
+            _save_debug_crop(bus_crop, label)
 
     # For zone-trigger cameras (Cam 1 / Cam 2): only report if bus has completely
     # crossed through the trigger zone (right→left). Without a completed crossing,
@@ -1211,7 +1133,7 @@ def _handle_event(event: tuple, frame, all_states: dict) -> None:
     event_type = event[0]
     if event_type == "provisional":
         _, number, direction, cam_label = event
-        action = {"entering": "entrando", "exiting": "saliendo"}.get(direction, "")
+        action = DIRECTION_LABELS.get(direction, "")
         suffix = f" ({action})" if action else ""
         print(f"[provisional] Bus {number}{suffix} — visto por {cam_label}, esperando confirmación...")
         # Update HUD on all tiles
@@ -1332,16 +1254,8 @@ def _report(number: int, direction: str, all_states: dict) -> None:
         "crops": {cam: Path(p).name for cam, p in saved_crop_paths.items()},
     })
 
-    # Every new detection triggers an individual Gemini analysis. When both
-    # legs of a round trip have analyses, the module fires the text comparison.
-    if is_new:
-        from web.damage_detector import analizar_individual_async
-        analizar_individual_async(
-            detection_id=nueva_id,
-            numero_flota=number,
-            direccion=direction,
-            fallback_path=main_path,
-        )
+    # Analysis is triggered manually from the dashboard (see web/app.py).
+    # Detections are stored with no analysis until the user decides.
 
     for s in all_states.values():
         with s.lock:
@@ -1414,8 +1328,7 @@ def _start_web_server(host: str = "0.0.0.0", port: int = 8000) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main_loop(skip: int, confirm: int, min_window: float, max_window: float,
-              fps_cap: int, min_bbox: int, debug: bool, exclude: set[int],
-              ocr_backend: str = "moondream") -> None:
+              fps_cap: int, min_bbox: int, debug: bool, exclude: set[int]) -> None:
     init_db()
     _start_web_server()
     states = {k: CameraState(k) for k in CAMERAS}
@@ -1425,7 +1338,6 @@ def main_loop(skip: int, confirm: int, min_window: float, max_window: float,
     detector = BusDetector()
     print(f"[INFO] YOLO listo en {detector._device}.")
 
-    from ocr.moondream_reader import get_moondream_reader
     print("[INFO] Precargando Moondream ...")
     _reader = get_moondream_reader()
     if _reader._model is None:
@@ -1442,7 +1354,7 @@ def main_loop(skip: int, confirm: int, min_window: float, max_window: float,
                              args=(state, detector, motion_filter, min_bbox, debug),
                              daemon=True).start()
             threading.Thread(target=ocr_worker,
-                             args=(state, global_buffer, states, motion_filter, debug, ocr_backend),
+                             args=(state, global_buffer, states, motion_filter, debug),
                              daemon=True).start()
         else:
             print(f"[INFO] {state.label}: solo video, sin detección (excluida)")
@@ -1483,15 +1395,9 @@ def main():
     parser.add_argument("--min-bbox", type=int,   default=80,   help="Tamaño mínimo de bbox en px (default: 80)")
     parser.add_argument("--exclude",  type=int,   nargs="*", default=[], help="Cámaras a excluir de detección (ej: --exclude 4)")
     parser.add_argument("--debug",    action="store_true",      help="Logs detallados del pipeline")
-    parser.add_argument(
-        "--ocr-backend",
-        choices=["moondream", "easyocr"],
-        default="moondream",
-        help="Backend OCR: 'moondream' (default, local) o 'easyocr' (legacy)",
-    )
     args = parser.parse_args()
 
-    print(f"Config: skip={args.skip} confirm={args.confirm} window={args.min_window}-{args.max_window}s fps={args.fps} min-bbox={args.min_bbox} exclude={args.exclude} ocr={args.ocr_backend}\n")
+    print(f"Config: skip={args.skip} confirm={args.confirm} window={args.min_window}-{args.max_window}s fps={args.fps} min-bbox={args.min_bbox} exclude={args.exclude}\n")
     main_loop(
         skip=args.skip,
         confirm=args.confirm,
@@ -1501,7 +1407,6 @@ def main():
         min_bbox=args.min_bbox,
         debug=args.debug,
         exclude=set(args.exclude),
-        ocr_backend=args.ocr_backend,
     )
 
 

@@ -351,6 +351,56 @@
       opacity: 0.35; transition: opacity 0.15s; vertical-align: middle; padding: 0 2px;
     }
     .btn-delete-det:hover { opacity: 1; }
+
+    /* ── Analizar / Comparar ── */
+    .capture-card .card-top {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 4px 6px 0;
+    }
+    .select-check {
+      width: 14px; height: 14px; cursor: pointer; accent-color: #2563eb;
+    }
+    .btn-analizar {
+      width: 100%; margin-top: 6px;
+      background: #1e293b; border: 1px solid #334155;
+      color: #93c5fd; font-size: 10px; font-weight: 600;
+      padding: 4px 6px; border-radius: 4px; cursor: pointer;
+      transition: background 0.15s, color 0.15s;
+    }
+    .btn-analizar:hover { background: #2563eb; color: #fff; border-color: #2563eb; }
+    .btn-analizar:disabled { opacity: 0.5; cursor: default; }
+    .btn-analizar.re { color: #fbbf24; border-color: #78350f; }
+    .btn-analizar.re:hover { background: #78350f; color: #fff; }
+
+    .compare-bar {
+      display: flex; align-items: center; gap: 12px;
+      padding: 10px 20px;
+      background: #0d0f14;
+      border-bottom: 1px solid #1e2330;
+      position: sticky; top: 0; z-index: 2;
+    }
+    .compare-bar .count {
+      font-size: 12px; color: #9ca3af;
+    }
+    .compare-bar .count strong { color: #60a5fa; }
+    .btn-compare {
+      background: #2563eb; border: none; color: #fff;
+      font-size: 12px; font-weight: 600;
+      padding: 6px 14px; border-radius: 6px; cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn-compare:hover { background: #1d4ed8; }
+    .btn-compare:disabled { background: #374151; cursor: default; color: #9ca3af; }
+    .btn-compare-clear {
+      background: none; border: 1px solid #374151; color: #9ca3af;
+      font-size: 11px; padding: 4px 10px; border-radius: 6px; cursor: pointer;
+    }
+    .btn-compare-clear:hover { border-color: #6b7280; color: #e0e6f0; }
+    .compare-status {
+      font-size: 11px; color: #6b7280; margin-left: auto;
+    }
+    .compare-status.running { color: #60a5fa; }
+    .compare-status.err { color: #f87171; }
   </style>
 </head>
 <body>
@@ -464,20 +514,36 @@
       <div class="section-title">Registro por bus</div>
       <div class="section-sub">Clic en una fila para ver capturas</div>
     </div>
+    <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <input id="bus-search" type="search" inputmode="numeric" placeholder="Buscar número de flota (parcial o total)…"
+        oninput="filterBuses()"
+        style="flex:1;min-width:220px;max-width:320px;background:#13161e;border:1px solid #1e2330;border-radius:8px;
+               padding:8px 12px;color:#e0e6f0;font-size:13px;outline:none" />
+      <span id="bus-search-count" style="font-size:11px;color:#6b7280"></span>
+      <span style="flex:1"></span>
+      <span id="bus-del-count" style="font-size:12px;color:#9ca3af">Seleccionados: <strong id="bus-del-num" style="color:#f87171">0</strong></span>
+      <button id="btn-bus-del" disabled onclick="handleBorrarBuses()"
+        style="background:#7f1d1d;border:none;color:#fff;font-size:12px;font-weight:600;
+               padding:6px 14px;border-radius:6px;cursor:pointer">
+        🗑 Borrar seleccionados
+      </button>
+    </div>
     <div class="table-wrap">
       <table>
         <thead>
           <tr>
+            <th style="width:32px"><input type="checkbox" id="bus-check-all" onclick="toggleAllBuses(this)" title="Seleccionar todos" style="cursor:pointer;accent-color:#2563eb" /></th>
             <th style="width:32px"></th>
             <th>Flota</th>
             <th>Entradas</th>
             <th>Salidas</th>
             <th>Total</th>
             <th>Estado</th>
+            <th style="width:44px"></th>
           </tr>
         </thead>
         <tbody id="bus-tbody">
-          <tr><td colspan="6"><div class="empty-state"><div class="icon">🚌</div><p>Sin detecciones aún</p></div></td></tr>
+          <tr><td colspan="8"><div class="empty-state"><div class="icon">🚌</div><p>Sin detecciones aún</p></div></td></tr>
         </tbody>
       </table>
     </div>
@@ -610,12 +676,25 @@
         updateDamageBadge(msg.numero_flota, msg.resultado, msg.severidad, msg.descripcion);
         if (busRegistry[msg.numero_flota]) {
           busRegistry[msg.numero_flota].ultimo_analisis = {
+            id: msg.comp_id,
             resultado: msg.resultado,
             severidad: msg.severidad,
             descripcion: msg.descripcion,
+            detection_ids: msg.detection_ids || [],
             timestamp_analisis: msg.timestamp,
           };
         }
+        const status = document.getElementById('cmpstatus-bus-' + msg.numero_flota);
+        if (status) {
+          if (msg.resultado === 'error') {
+            status.textContent = 'Error: ' + (msg.descripcion || 'sin detalle');
+            status.className = 'compare-status err';
+          } else {
+            status.textContent = `Comparación lista (${(msg.detection_ids || []).length} fotos)`;
+            status.className = 'compare-status';
+          }
+        }
+        clearSeleccion(msg.numero_flota);
       }
 
       if (msg.type === 'individual_analysis') {
@@ -630,6 +709,15 @@
         const box = document.getElementById('ind-analisis-' + msg.detection_id);
         if (box) {
           box.outerHTML = individualAnalisisHtml(msg.detection_id, msg.estado, msg.analisis);
+        }
+        // Restaurar botón Re-analizar
+        const card = document.getElementById('det-card-' + msg.detection_id);
+        if (card && !document.getElementById('btn-an-' + msg.detection_id)) {
+          const info = card.querySelector('.card-info');
+          if (info) {
+            info.insertAdjacentHTML('beforeend',
+              analizarBtnHtml(msg.detection_id, msg.estado, msg.analisis));
+          }
         }
       }
     };
@@ -756,6 +844,118 @@
       return;
     }
     tbody.innerHTML = buses.map(b => busRowHtml(b)).join('');
+    filterBuses();
+  }
+
+  // ── Borrado de buses ───────────────────────────────────────────────────────
+  const busSeleccionados = new Set();
+
+  function onBusDelToggle(cb) {
+    const num = parseInt(cb.dataset.bus, 10);
+    if (cb.checked) busSeleccionados.add(num);
+    else busSeleccionados.delete(num);
+    updateBusDelBar();
+    syncMasterCheckbox();
+  }
+
+  function updateBusDelBar() {
+    const numEl = document.getElementById('bus-del-num');
+    const btn = document.getElementById('btn-bus-del');
+    const n = busSeleccionados.size;
+    if (numEl) numEl.textContent = n;
+    if (btn) btn.disabled = n === 0;
+  }
+
+  function syncMasterCheckbox() {
+    const master = document.getElementById('bus-check-all');
+    if (!master) return;
+    const visibles = Array.from(document.querySelectorAll('input.bus-del-check'))
+      .filter(cb => cb.closest('tr').style.display !== 'none');
+    if (!visibles.length) { master.checked = false; master.indeterminate = false; return; }
+    const marcados = visibles.filter(cb => cb.checked).length;
+    master.checked = marcados === visibles.length;
+    master.indeterminate = marcados > 0 && marcados < visibles.length;
+  }
+
+  function toggleAllBuses(master) {
+    const visibles = Array.from(document.querySelectorAll('input.bus-del-check'))
+      .filter(cb => cb.closest('tr').style.display !== 'none');
+    visibles.forEach(cb => {
+      cb.checked = master.checked;
+      const num = parseInt(cb.dataset.bus, 10);
+      if (master.checked) busSeleccionados.add(num);
+      else busSeleccionados.delete(num);
+    });
+    updateBusDelBar();
+  }
+
+  async function handleBorrarBus(num) {
+    if (!confirm(`¿Borrar TODO el registro del bus ${num}? Esto elimina todas sus capturas y análisis. No se puede deshacer.`)) return;
+    const r = await fetch(`/api/buses/${num}`, { method: 'DELETE' });
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      alert('Error: ' + (e.detail || r.status));
+      return;
+    }
+    removerBusDelRegistry(num);
+  }
+
+  async function handleBorrarBuses() {
+    const nums = Array.from(busSeleccionados);
+    if (!nums.length) return;
+    if (!confirm(`¿Borrar ${nums.length} bus(es) y TODOS sus registros? No se puede deshacer.`)) return;
+    const r = await fetch('/api/buses/borrar-varios', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ numeros_flota: nums }),
+    });
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      alert('Error: ' + (e.detail || r.status));
+      return;
+    }
+    const data = await r.json();
+    (data.deleted_buses || nums).forEach(n => removerBusDelRegistry(n));
+    busSeleccionados.clear();
+    updateBusDelBar();
+  }
+
+  function removerBusDelRegistry(num) {
+    delete busRegistry[num];
+    busSeleccionados.delete(num);
+    const id = 'bus-' + num;
+    const main = document.getElementById('main-' + id);
+    const cap  = document.getElementById('captures-' + id);
+    if (main) main.remove();
+    if (cap) cap.remove();
+    // Si quedó vacío, mostrar empty state
+    const tbody = document.getElementById('bus-tbody');
+    if (tbody && !tbody.querySelector('tr.bus-row-main')) {
+      tbody.innerHTML = '<tr><td colspan="8"><div class="empty-state"><div class="icon">🚌</div><p>Sin detecciones aún</p></div></td></tr>';
+    }
+    filterBuses();
+  }
+
+  function filterBuses() {
+    const input = document.getElementById('bus-search');
+    const q = (input && input.value || '').trim();
+    const tbody = document.getElementById('bus-tbody');
+    if (!tbody) return;
+    let visibles = 0, total = 0;
+    tbody.querySelectorAll('tr.bus-row-main').forEach(main => {
+      const id = main.id.replace('main-', '');  // bus-<numero>
+      const num = id.replace('bus-', '');
+      const match = !q || num.includes(q);
+      main.style.display = match ? '' : 'none';
+      const cap = document.getElementById('captures-' + id);
+      if (cap && !match) cap.classList.remove('open');
+      if (cap) cap.style.display = match ? '' : 'none';
+      total++;
+      if (match) visibles++;
+    });
+    const count = document.getElementById('bus-search-count');
+    if (count) count.textContent = q ? `${visibles}/${total}` : '';
+    syncMasterCheckbox();
   }
 
   function damageBadgeHtml(analisis) {
@@ -771,48 +971,42 @@
       </div>`;
     }
     if (analisis.resultado === 'inconcluye') {
-      const retryBtn = analisis.id
-        ? `<button onclick="reintentarAnalisis(${analisis.id})" title="Reintentar análisis"
-             style="margin-left:6px;background:none;border:none;color:#94a3b8;cursor:pointer;font-size:13px">↺</button>`
-        : '';
-      return `<span class="badge analisis" title="${analisis.descripcion}">? Inconcluye${retryBtn}</span>`;
+      return `<span class="badge analisis" title="${analisis.descripcion}">? Inconcluye</span>`;
     }
     // resultado === 'error'
-    const retryBtn = analisis.id
-      ? `<button onclick="reintentarAnalisis(${analisis.id})" title="Reintentar análisis"
-           style="margin-left:6px;background:none;border:none;color:#94a3b8;cursor:pointer;font-size:13px">↺</button>`
-      : '';
-    return `<span class="badge analisis" title="${analisis.descripcion}">Error${retryBtn}</span>`;
-  }
-
-  async function reintentarAnalisis(compId) {
-    try {
-      const r = await fetch(`/api/comparaciones/${compId}/reintentar`, { method: 'POST' });
-      if (!r.ok) { const e = await r.json(); alert('Error: ' + (e.detail || r.status)); }
-    } catch(e) { alert('Error al reintentar: ' + e.message); }
+    return `<span class="badge analisis" title="${analisis.descripcion}">Error</span>`;
   }
 
   function busRowHtml(b) {
     const id = 'bus-' + b.numero_flota;
-    return `<tr class="bus-row-main" onclick="toggleBus(${b.numero_flota})" id="main-${id}">
-        <td><span class="expand-arrow" id="arrow-${id}">▶</span></td>
-        <td><span class="fleet-number">${b.numero_flota}</span></td>
-        <td><span class="badge entering">↙ ${b.entradas}</span></td>
-        <td><span class="badge exiting">↗ ${b.salidas}</span></td>
-        <td style="color:#60a5fa;font-weight:600">${b.total}</td>
-        <td id="damage-${id}">${damageBadgeHtml(b.ultimo_analisis)}</td>
+    return `<tr class="bus-row-main" id="main-${id}">
+        <td onclick="event.stopPropagation()"><input type="checkbox" class="bus-del-check" data-bus="${b.numero_flota}" onclick="onBusDelToggle(this)" style="cursor:pointer;accent-color:#ef4444" /></td>
+        <td onclick="toggleBus(${b.numero_flota})"><span class="expand-arrow" id="arrow-${id}">▶</span></td>
+        <td onclick="toggleBus(${b.numero_flota})"><span class="fleet-number">${b.numero_flota}</span></td>
+        <td onclick="toggleBus(${b.numero_flota})"><span class="badge entering">↙ ${b.entradas}</span></td>
+        <td onclick="toggleBus(${b.numero_flota})"><span class="badge exiting">↗ ${b.salidas}</span></td>
+        <td onclick="toggleBus(${b.numero_flota})" style="color:#60a5fa;font-weight:600">${b.total}</td>
+        <td onclick="toggleBus(${b.numero_flota})" id="damage-${id}">${damageBadgeHtml(b.ultimo_analisis)}</td>
+        <td><button class="btn-delete-det" title="Borrar todo el registro del bus" onclick="handleBorrarBus(${b.numero_flota})">&#128465;</button></td>
       </tr>
       <tr class="bus-row-captures" id="captures-${id}">
-        <td colspan="6">
+        <td colspan="8">
+          <div class="compare-bar" id="cmpbar-${id}">
+            <span class="count">Seleccionadas: <strong id="cmpcount-${id}">0</strong></span>
+            <button class="btn-compare" id="btncmp-${id}" disabled onclick="handleComparar(${b.numero_flota})">Comparar seleccionadas</button>
+            <button class="btn-compare-clear" onclick="clearSeleccion(${b.numero_flota})">Limpiar</button>
+            <span class="compare-status" id="cmpstatus-${id}"></span>
+          </div>
           <div class="captures-grid" id="grid-${id}">
-            ${b.capturas.map(c => captureCardHtml(c)).join('')}
+            ${b.capturas.map(c => captureCardHtml(c, b.numero_flota)).join('')}
           </div>
         </td>
       </tr>`;
   }
 
-  function captureCardHtml(c) {
+  function captureCardHtml(c, numero_flota) {
     const detId = c.id;
+    const bus = numero_flota != null ? numero_flota : (c.numero_flota || '');
     let imgHtml;
     if (c.imagen_path) {
       const filename = (c.imagen_path.split('/').pop() || '').split('\\').pop();
@@ -839,23 +1033,46 @@
     }
     const deleteBtn = detId ? `<button class="btn-delete-det" title="Eliminar deteccion" onclick="deleteDetection(${detId},this)">&#128465;</button>` : '';
     const analisisHtml = individualAnalisisHtml(detId, c.analisis_estado, c.analisis_individual);
+    const analizarBtn  = analizarBtnHtml(detId, c.analisis_estado, c.analisis_individual);
+    const checkbox = detId
+      ? `<input type="checkbox" class="select-check" data-bus="${bus}" data-det-id="${detId}" onclick="onSelectToggle(this)" title="Seleccionar para comparar" />`
+      : '';
     return `<div class="capture-card" id="det-card-${detId}">
+      <div class="card-top">
+        ${checkbox}
+        ${deleteBtn}
+      </div>
       ${imgHtml}
       <div class="card-info">
-        <div class="card-time">${c.timestamp.slice(11,19)} ${deleteBtn}</div>
+        <div class="card-time">${c.timestamp.slice(11,19)}</div>
         ${dirBadge(c.direccion)}
+        ${analizarBtn}
       </div>
       ${cropsHtml}
       ${analisisHtml}
     </div>`;
   }
 
+  function analizarBtnHtml(detId, estado, texto) {
+    if (!detId) return '';
+    // Si está analizándose ahora, no mostrar botón (solo el spinner en ind-analisis)
+    if (estado === 'pendiente') return '';
+    const hasAnalysis = !!texto;
+    const cls = hasAnalysis ? 'btn-analizar re' : 'btn-analizar';
+    const label = hasAnalysis ? '↻ Re-analizar' : '▷ Analizar';
+    return `<button class="${cls}" id="btn-an-${detId}" onclick="handleAnalizar(${detId})">${label}</button>`;
+  }
+
   function individualAnalisisHtml(detId, estado, texto) {
     if (!detId) return '';
-    if (!texto) {
+    if (estado === 'pendiente') {
       return `<div class="ind-analisis pendiente" id="ind-analisis-${detId}">
         <span class="ind-label">Análisis:</span> <span class="ind-spinner">analizando…</span>
       </div>`;
+    }
+    if (!texto) {
+      // Sin análisis: no mostramos el contenedor hasta que el usuario analice
+      return `<div class="ind-analisis" id="ind-analisis-${detId}" style="display:none"></div>`;
     }
     let cls = 'inconcluye';
     let icon = '?';
@@ -867,6 +1084,82 @@
       <div class="ind-header"><span class="ind-icon">${icon}</span><span class="ind-label">Análisis individual</span></div>
       <pre class="ind-body">${pre}</pre>
     </div>`;
+  }
+
+  // ── Análisis individual manual ─────────────────────────────────────────────
+  async function handleAnalizar(detId) {
+    // Si ya hay análisis, pedir confirmación antes de sobrescribir
+    const btn = document.getElementById('btn-an-' + detId);
+    const hasAnalysis = btn && btn.classList.contains('re');
+    if (hasAnalysis && !confirm('¿Re-analizar esta captura? Se sobrescribirá el análisis existente.')) return;
+    // Optimistic UI: mostrar spinner
+    const box = document.getElementById('ind-analisis-' + detId);
+    if (box) {
+      box.outerHTML = `<div class="ind-analisis pendiente" id="ind-analisis-${detId}">
+        <span class="ind-label">Análisis:</span> <span class="ind-spinner">analizando…</span>
+      </div>`;
+    }
+    if (btn) btn.remove();
+    try {
+      const r = await fetch(`/api/detecciones/${detId}/analizar`, { method: 'POST' });
+      if (!r.ok) {
+        const e = await r.json().catch(() => ({}));
+        alert('Error: ' + (e.detail || r.status));
+      }
+    } catch(e) { alert('Error al analizar: ' + e.message); }
+  }
+
+  // ── Selección para comparar ────────────────────────────────────────────────
+  const selecciones = {}; // { numero_flota: Set<detection_id> }
+
+  function onSelectToggle(cb) {
+    const bus = parseInt(cb.dataset.bus, 10);
+    const detId = parseInt(cb.dataset.detId, 10);
+    if (!selecciones[bus]) selecciones[bus] = new Set();
+    if (cb.checked) selecciones[bus].add(detId);
+    else selecciones[bus].delete(detId);
+    updateCompareBar(bus);
+  }
+
+  function updateCompareBar(bus) {
+    const id = 'bus-' + bus;
+    const count = (selecciones[bus] ? selecciones[bus].size : 0);
+    const countEl = document.getElementById('cmpcount-' + id);
+    const btn = document.getElementById('btncmp-' + id);
+    if (countEl) countEl.textContent = count;
+    if (btn) btn.disabled = count < 2;
+  }
+
+  function clearSeleccion(bus) {
+    selecciones[bus] = new Set();
+    document.querySelectorAll(`input.select-check[data-bus="${bus}"]`).forEach(cb => cb.checked = false);
+    updateCompareBar(bus);
+    const status = document.getElementById('cmpstatus-bus-' + bus);
+    if (status) { status.textContent = ''; status.className = 'compare-status'; }
+  }
+
+  async function handleComparar(bus) {
+    const ids = Array.from(selecciones[bus] || []);
+    if (ids.length < 2) return;
+    const status = document.getElementById('cmpstatus-bus-' + bus);
+    if (status) { status.textContent = `Comparando ${ids.length} fotos…`; status.className = 'compare-status running'; }
+    const btn = document.getElementById('btncmp-bus-' + bus);
+    if (btn) btn.disabled = true;
+    try {
+      const r = await fetch('/api/comparaciones/nueva', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ numero_flota: bus, detection_ids: ids }),
+      });
+      if (!r.ok) {
+        const e = await r.json().catch(() => ({}));
+        if (status) { status.textContent = 'Error: ' + (e.detail || r.status); status.className = 'compare-status err'; }
+        if (btn) btn.disabled = false;
+      }
+    } catch(e) {
+      if (status) { status.textContent = 'Error: ' + e.message; status.className = 'compare-status err'; }
+      if (btn) btn.disabled = false;
+    }
   }
 
   async function deleteCrop(detId, camLabel, btn) {
@@ -956,7 +1249,7 @@
     cells[4].textContent = b.total;
     const grid = document.getElementById('grid-' + id);
     if (grid) {
-      grid.insertAdjacentHTML('beforeend', captureCardHtml(b.capturas[b.capturas.length - 1]));
+      grid.insertAdjacentHTML('beforeend', captureCardHtml(b.capturas[b.capturas.length - 1], n));
     }
   }
 

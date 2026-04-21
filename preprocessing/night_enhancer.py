@@ -48,17 +48,6 @@ def _gamma_lut(gamma: float) -> np.ndarray:
     return lut
 
 
-def sharpness(frame: np.ndarray) -> float:
-    """
-    Laplacian variance — valor alto = nítido, bajo = movido.
-    En CCTV típicamente: >300 muy nítido, 100-300 aceptable, <100 movido.
-    """
-    if frame is None or frame.size == 0:
-        return 0.0
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
-
 def enhance(frame: np.ndarray, gamma: float = NIGHT_GAMMA) -> np.ndarray:
     """CLAHE en canal L de LAB + gamma. Devuelve BGR."""
     if frame is None or frame.size == 0:
