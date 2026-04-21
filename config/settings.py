@@ -10,10 +10,6 @@ YOLO_MIN_CONFIDENCE = 0.40
 # yolov8m.pt gives reliable detection on all 3 camera types we tested.
 YOLO_MODEL = "yolov8m.pt"
 
-# Minimum OCR confidence to accept a candidate (0-1)
-# Values below this are usually background text, noise, or partial reads
-OCR_MIN_CONFIDENCE = 0.65
-
 # ── Fleet whitelist (loaded from config/internos.csv) ────────────────────────
 # Only numbers in this set are accepted. Replaces the old min/max/blacklist approach.
 
@@ -34,10 +30,6 @@ def _load_whitelist() -> set[int]:
     return nums
 
 FLEET_WHITELIST: set[int] = _load_whitelist()
-
-# Legacy aliases kept for backward compatibility in scoring logic
-FLEET_MIN = min(FLEET_WHITELIST) if FLEET_WHITELIST else 1
-FLEET_MAX = max(FLEET_WHITELIST) if FLEET_WHITELIST else 9999
 
 # 4-digit numbers >= this value are assumed to be years (e.g. 2026 from CCTV timestamp)
 FLEET_YEAR_THRESHOLD = 2000
@@ -87,3 +79,9 @@ NIGHT_GAMMA = 1.6
 # Threshold de YOLO reducido en noche: el contraste enhancado puede generar
 # bbox ligeramente menos confiables y conviene ser más permisivo.
 YOLO_MIN_CONFIDENCE_NIGHT = 0.30
+
+# ── UI labels ───────────────────────────────────────────────────────────────
+DIRECTION_LABELS: dict[str, str] = {
+    "entering": "entrando",
+    "exiting":  "saliendo",
+}
