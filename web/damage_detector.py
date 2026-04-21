@@ -1,18 +1,15 @@
 """
-Análisis de daños con Gemini 2.0 Flash.
-
-Dos operaciones independientes:
+Análisis de daños con Gemini 2.5 Flash — todos manuales desde el dashboard.
 
 1. `analizar_individual_async(detection_id, ...)`
-   Se dispara apenas se guarda una detección (entrada o salida). Manda todas las
-   capturas por cámara a Gemini y pide un reporte del estado VISIBLE del bus
-   (OK / DAÑADO / dónde). El texto se guarda en `detecciones.analisis_individual`.
-   Este paso permite probar Gemini sin esperar un ida y vuelta completo.
+   Lo dispara el usuario desde el botón "Analizar" de una captura. Manda los
+   crops disponibles (o la imagen principal) a Gemini y guarda el reporte en
+   `detecciones.analisis_individual`.
 
-2. `comparar_pair_async(salida_id, entrada_id, ...)`
-   Cuando la segunda detección (entrada) tiene su análisis listo y hay una salida
-   anterior con análisis, se comparan los DOS TEXTOS (no las imágenes) y se
-   guarda el resultado en `comparaciones`.
+2. `comparar_visual_async(numero_flota, detection_ids)`
+   Lo dispara el usuario desde "Comparar seleccionadas" (N ≥ 2 fotos). Manda
+   las imágenes directamente a Gemini y guarda un resumen de diferencias en
+   `comparaciones`.
 
 Requiere: GOOGLE_API_KEY en el entorno.
 """
@@ -26,10 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from web.database import (
     actualizar_analisis_individual,
-    get_ultima_salida_con_analisis,
-    get_deteccion_entrada_pendiente,
     get_deteccion_by_id,
-    insertar_comparacion,
+    insertar_comparacion_n,
     obtener_crops,
 )
 
@@ -46,21 +41,6 @@ PROMPT_INDIVIDUAL = (
     "ZONAS: <lista separada por comas de: frente, lateral izquierdo, lateral derecho, trasero> o 'no aplica'\n"
     "DESCRIPCION: <una oración en español, específica, mencionando zona y tipo de daño si lo hay>\n"
 )
-
-PROMPT_COMPARACION = (
-    "Comparar dos reportes del bus interno {numero_flota}.\n\n"
-    "REPORTE DE SALIDA (cuando salió del depósito):\n{salida}\n\n"
-    "REPORTE DE ENTRADA (cuando volvió):\n{entrada}\n\n"
-    "¿Aparecieron daños NUEVOS entre salida y entrada? Un daño es 'nuevo' si está "
-    "mencionado en el reporte de ENTRADA pero no en el de SALIDA, o si empeoró. "
-    "Ignorá diferencias de redacción o nivel de detalle.\n"
-    "Respondé SOLO en este formato (4 líneas):\n"
-    "RESULTADO: OK | DAÑOS | INCONCLUYE\n"
-    "SEVERIDAD: ninguna | menor | mayor\n"
-    "ZONA: frente | lateral izquierdo | lateral derecho | trasero | múltiple | no aplica\n"
-    "DESCRIPCION: <una oración en español>\n"
-)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Análisis individual
@@ -167,48 +147,36 @@ def _analizar_individual(detection_id: int, numero_flota: int, direccion: str,
     except Exception:
         pass
 
-    # Si este fue el análisis que completó el par, disparar comparación textual.
-    _maybe_trigger_comparison(numero_flota, detection_id, direccion)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Comparación text-vs-text
+# Comparación visual N-way (manual)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _maybe_trigger_comparison(numero_flota: int, detection_id: int, direccion: str) -> None:
-    """
-    Llamado al terminar un análisis individual. Busca el par salida+entrada con
-    análisis listos y dispara la comparación de textos si no existe ya.
-    """
-    if direccion == "entering":
-        salida = get_ultima_salida_con_analisis(numero_flota)
-        if salida:
-            comparar_pair_async(
-                numero_flota=numero_flota,
-                salida_id=salida["id"],
-                entrada_id=detection_id,
-            )
-    elif direccion == "exiting":
-        entrada = get_deteccion_entrada_pendiente(
-            numero_flota,
-            desde_ts=datetime.now().strftime("%Y-%m-%d 00:00:00"),
-        )
-        # Una entrada sólo tiene sentido si fue POSTERIOR a esta salida.
-        salida_det = get_deteccion_by_id(detection_id)
-        if entrada and salida_det and entrada["timestamp"] > salida_det["timestamp"]:
-            comparar_pair_async(
-                numero_flota=numero_flota,
-                salida_id=detection_id,
-                entrada_id=entrada["id"],
-            )
+PROMPT_COMPARACION_VISUAL = (
+    "Te muestro {n} fotos del bus interno {numero_flota} tomadas en distintos "
+    "momentos (entradas y salidas del depósito). El orden en que te las paso "
+    "coincide con la cronología.\n\n"
+    "{labels}\n\n"
+    "Comparálas entre sí y buscá ÚNICAMENTE daños físicos NUEVOS o que hayan "
+    "empeorado: rayones profundos, abolladuras, espejos rotos, vidrios rotos, "
+    "paragolpes dañados, faltantes. Ignorá suciedad, barro, reflejos y "
+    "diferencias de iluminación o ángulo.\n"
+    "Respondé SOLO en este formato (5 líneas, obligatorio):\n"
+    "RESULTADO: OK | DAÑOS | INCONCLUYE\n"
+    "SEVERIDAD: ninguna | menor | mayor\n"
+    "ZONAS: <lista separada por comas de: frente, lateral izquierdo, lateral derecho, trasero> o 'no aplica'\n"
+    "ENTRE_FOTOS: <indicá entre qué fotos aparece el cambio, ej: '2 vs 3' o 'no aplica'>\n"
+    "DESCRIPCION: <una oración en español, específica>\n"
+)
 
 
-def comparar_pair_async(numero_flota: int, salida_id: int, entrada_id: int) -> None:
+def comparar_visual_async(numero_flota: int, detection_ids: list[int]) -> None:
+    """Dispara la comparación N-way en un thread y retorna inmediato."""
     t = threading.Thread(
-        target=_comparar_textos,
-        args=(numero_flota, salida_id, entrada_id),
+        target=_comparar_visual,
+        args=(numero_flota, list(detection_ids)),
         daemon=True,
-        name=f"compare-{numero_flota}",
+        name=f"compare-visual-{numero_flota}",
     )
     t.start()
 
@@ -233,30 +201,55 @@ def _parse_comparacion(text: str) -> tuple[str, str, str]:
     return resultado, severidad, descripcion
 
 
-def _comparar_textos(numero_flota: int, salida_id: int, entrada_id: int) -> None:
-    salida_det = get_deteccion_by_id(salida_id)
-    entrada_det = get_deteccion_by_id(entrada_id)
-    if not salida_det or not entrada_det:
-        return
-    if not salida_det.get("analisis_individual") or not entrada_det.get("analisis_individual"):
+def _comparar_visual(numero_flota: int, detection_ids: list[int]) -> None:
+    if len(detection_ids) < 2:
         return
 
-    print(f"[DamageDetector] comparando bus {numero_flota}: salida #{salida_id} vs entrada #{entrada_id}")
+    detecciones = []
+    for did in detection_ids:
+        det = get_deteccion_by_id(did)
+        if not det:
+            continue
+        path = det.get("imagen_path")
+        if not path:
+            crops = obtener_crops(did)
+            if crops:
+                path = crops[0]["crop_path"]
+        if not path:
+            continue
+        detecciones.append((det, path))
+
+    if len(detecciones) < 2:
+        _insertar_error(numero_flota, detection_ids, "No se pudieron cargar imágenes suficientes")
+        return
+
+    print(f"[DamageDetector] comparando visual bus {numero_flota}: {len(detecciones)} fotos")
     try:
         from google import genai
         from google.genai import types
+        import PIL.Image
 
         client = genai.Client()
-        prompt = PROMPT_COMPARACION.format(
+        labels_lines = []
+        pil_imgs = []
+        for idx, (det, path) in enumerate(detecciones, start=1):
+            evento = ("saliendo" if det["direccion"] == "exiting"
+                      else "entrando" if det["direccion"] == "entering"
+                      else "paso")
+            labels_lines.append(f"Foto {idx} — {det['timestamp']} ({evento})")
+            pil_imgs.append(PIL.Image.open(path))
+        labels = "\n".join(labels_lines)
+        prompt = PROMPT_COMPARACION_VISUAL.format(
+            n=len(detecciones),
             numero_flota=numero_flota,
-            salida=salida_det["analisis_individual"],
-            entrada=entrada_det["analisis_individual"],
+            labels=labels,
         )
+
         resp = client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=[prompt],
+            contents=[*pil_imgs, prompt],
             config=types.GenerateContentConfig(
-                max_output_tokens=300,
+                max_output_tokens=500,
                 temperature=0.1,
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
@@ -267,20 +260,43 @@ def _comparar_textos(numero_flota: int, salida_id: int, entrada_id: int) -> None
     except Exception as e:
         resultado, severidad, descripcion = "error", "desconocida", str(e)
 
-    insertar_comparacion(
-        numero_flota, salida_id, entrada_id,
+    det_ids_used = [d["id"] for d, _ in detecciones]
+    comp_id = insertar_comparacion_n(
+        numero_flota, det_ids_used,
         resultado, descripcion, severidad,
     )
-    print(f"[DamageDetector] bus {numero_flota}: {resultado} ({severidad}) — {descripcion}")
+    print(f"[DamageDetector] bus {numero_flota} comp_id={comp_id}: {resultado} ({severidad}) — {descripcion}")
 
     try:
         from web.app import emit_event
         emit_event({
             "type": "damage_analysis",
+            "comp_id": comp_id,
             "numero_flota": numero_flota,
+            "detection_ids": det_ids_used,
             "resultado": resultado,
             "severidad": severidad,
             "descripcion": descripcion,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    except Exception:
+        pass
+
+
+def _insertar_error(numero_flota: int, detection_ids: list[int], msg: str) -> None:
+    comp_id = insertar_comparacion_n(
+        numero_flota, detection_ids, "error", msg, "desconocida",
+    )
+    try:
+        from web.app import emit_event
+        emit_event({
+            "type": "damage_analysis",
+            "comp_id": comp_id,
+            "numero_flota": numero_flota,
+            "detection_ids": detection_ids,
+            "resultado": "error",
+            "severidad": "desconocida",
+            "descripcion": msg,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
     except Exception:

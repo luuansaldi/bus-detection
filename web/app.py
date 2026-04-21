@@ -17,14 +17,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from web.database import (init_db, obtener, obtener_crops, stats_por_hora, stats_por_dia,
                            stats_frecuentes, stats_por_numero, limpiar_capturas_antiguas,
-                           get_comparacion, get_deteccion_by_id,
-                           eliminar_crop, set_main_image, eliminar_deteccion)
+                           get_deteccion_by_id,
+                           eliminar_crop, set_main_image, eliminar_deteccion,
+                           eliminar_bus)
 from config.settings import CAPTURES_RETENTION_DAYS
 
 CAPTURES_DIR = Path(__file__).resolve().parent.parent / "captures"
@@ -159,24 +160,83 @@ def get_detection_crops(detection_id: int):
     return JSONResponse(content=crops)
 
 
-@app.post("/api/comparaciones/{comp_id}/reintentar")
-def reintentar_comparacion(comp_id: int):
-    comp = get_comparacion(comp_id)
-    if not comp:
-        raise HTTPException(status_code=404, detail="Comparación no encontrada")
-    if comp["resultado"] not in ("error", "inconcluye"):
-        raise HTTPException(status_code=400, detail="Solo se pueden reintentar análisis con resultado error o inconcluye")
-    sal = get_deteccion_by_id(comp["salida_id"])
-    ent = get_deteccion_by_id(comp["entrada_id"])
-    if not sal or not ent:
-        raise HTTPException(status_code=404, detail="Detecciones originales no encontradas")
-    from web.damage_detector import comparar_viaje_async
-    comparar_viaje_async(
-        comp["numero_flota"],
-        sal["imagen_path"], ent["imagen_path"],
-        comp["salida_id"], comp["entrada_id"],
+@app.post("/api/detecciones/{detection_id}/analizar")
+def analizar_deteccion(detection_id: int):
+    det = get_deteccion_by_id(detection_id)
+    if not det:
+        raise HTTPException(status_code=404, detail="Detección no encontrada")
+    from web.damage_detector import analizar_individual_async
+    analizar_individual_async(
+        detection_id=detection_id,
+        numero_flota=det["numero_flota"],
+        direccion=det["direccion"],
+        fallback_path=det.get("imagen_path"),
     )
-    return JSONResponse(content={"status": "reintentando"})
+    return JSONResponse(status_code=202, content={"status": "analizando", "detection_id": detection_id})
+
+
+@app.post("/api/comparaciones/nueva")
+def comparar_nueva(payload: dict = Body(...)):
+    numero_flota = payload.get("numero_flota")
+    detection_ids = payload.get("detection_ids") or []
+    if not isinstance(numero_flota, int):
+        raise HTTPException(status_code=400, detail="numero_flota requerido (int)")
+    if not isinstance(detection_ids, list) or len(detection_ids) < 2:
+        raise HTTPException(status_code=400, detail="detection_ids debe ser lista con al menos 2 ids")
+    # Validar que todas las detecciones existan y pertenezcan al mismo bus
+    for did in detection_ids:
+        det = get_deteccion_by_id(did)
+        if not det:
+            raise HTTPException(status_code=404, detail=f"Detección {did} no encontrada")
+        if det["numero_flota"] != numero_flota:
+            raise HTTPException(status_code=400, detail=f"Detección {did} no pertenece al bus {numero_flota}")
+    from web.damage_detector import comparar_visual_async
+    comparar_visual_async(numero_flota, detection_ids)
+    return JSONResponse(status_code=202, content={"status": "comparando", "count": len(detection_ids)})
+
+
+@app.delete("/api/buses/{numero_flota}")
+def delete_bus(numero_flota: int):
+    count, paths = eliminar_bus(numero_flota)
+    if count == 0:
+        raise HTTPException(status_code=404, detail="Bus no encontrado")
+    import os
+    for p in paths:
+        if p and os.path.exists(p):
+            try: os.unlink(p)
+            except OSError: pass
+    return JSONResponse(content={"deleted_detections": count, "deleted_files": len(paths)})
+
+
+@app.post("/api/buses/borrar-varios")
+def delete_buses_bulk(payload: dict = Body(...)):
+    nums = payload.get("numeros_flota") or []
+    if not isinstance(nums, list) or not nums:
+        raise HTTPException(status_code=400, detail="numeros_flota debe ser lista no vacía")
+    import os
+    total_det = 0
+    total_files = 0
+    borrados = []
+    for n in nums:
+        if not isinstance(n, int):
+            continue
+        count, paths = eliminar_bus(n)
+        if count == 0:
+            continue
+        total_det += count
+        for p in paths:
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                    total_files += 1
+                except OSError:
+                    pass
+        borrados.append(n)
+    return JSONResponse(content={
+        "deleted_buses": borrados,
+        "deleted_detections": total_det,
+        "deleted_files": total_files,
+    })
 
 
 @app.delete("/api/detecciones/{detection_id}")
